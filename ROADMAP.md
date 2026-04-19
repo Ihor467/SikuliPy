@@ -76,19 +76,30 @@ permissions. `mss` handles both but Wayland may need `pipewire` fallback.
 * `core/region.py` — `text()`, `words()`, `find_text()`, `find_all_text()`, `has_text()` with region-offset → absolute screen coordinates
 * Tests: 15 tests in `tests/test_phase3_ocr.py`, all using a fake backend — no Tesseract binary or NumPy needed.
 
-### Phase 4 — Android via ADB
-* `android/client.py` + `android/screen.py`
-* `ADBScreen` as a `Region` subclass whose `capture()` calls
-  `adb exec-out screencap -p` and whose `click` calls `input tap`.
+### Phase 4 — Android via ADB ✅
+* `android/_backend.py` — swappable `AdbClientBackend`/`AdbDeviceBackend` Protocol (pure-python-adb default + test fake)
+* `android/client.py` — `ADBClient` (`devices`/`device`/`connect`) + `ADBDevice` (`tap`/`swipe`/`long_press`/`input_text`/`key_event`/`screencap`/`size`)
+* `android/screen.py` — `ADBScreen` as a `Region` subclass; `_capture_bgr` uses `screencap`, `click`/`double_click`/`right_click`/`drag_drop`/`type`/`paste` dispatch via ADB; Pattern targets resolved via `find()` and `targetOffset`
+* `find_text_coordinates(needle)` bridges to OCR for Java parity with `ADBScreen.findTextCoordinates`
+* Tests: 18 tests in `tests/test_phase4_android.py` using a recording fake — no adb server or device needed.
 
-### Phase 5 — VNC + SSH
-* `vnc/screen.py` using `vncdotool`
-* `vnc/ssh.py` using `sshtunnel`
+### Phase 5 — VNC + SSH ✅
+* `vnc/_backend.py` — swappable `VncConnector`/`VncBackend` Protocol (vncdotool default + test fake) with RFB button-mask bookkeeping
+* `vnc/xkeysym.py` — full X11 keysym table (auto-extracted from `XKeySym.java`) + `keysym_name()` reverse lookup
+* `vnc/screen.py` — `VNCScreen` as a `Region` subclass; `_capture_bgr` pulls framebuffer, `click`/`double_click`/`right_click`/`middle_click`/`hover`/`drag_drop`/`wheel` translate to RFB pointer events with button masks, `type`/`paste`/`key_up_all` send X11 keysyms with auto-shift on US layout; Pattern targets resolved via `find()` with `targetOffset`; `start()` reuses per-host:port singletons like the Java version
+* `vnc/ssh.py` — `SSHTunnel` port of `com.sikulix.util.SSHTunnel`; swappable `TunnelOpener` (sshtunnel/paramiko default + test fake), context-manager API, password / private-key auth, `open_auto_port` for ephemeral local bind
+* Tests: 24 tests in `tests/test_phase5_vnc.py` using recording fakes — no RFB server or SSH daemon needed.
 
-### Phase 6 — Script runners
-* `runners/python_runner.py` (exec in namespace with SikuliPy preloaded)
-* `runners/robot_runner.py` (optional Robot Framework)
-* PowerShell / AppleScript / Bash via `subprocess`
+### Phase 6 — Script runners ✅
+* `runners/base.py` — `Runner` ABC + `Options(args, work_dir, env, silent)` + module-level registry (`register`/`runner_for`/`runner_by_name`/`run_file`/`run_string`); URLs with a `proto://` prefix are rejected just like `AbstractLocalFileScriptRunner.canHandle`
+* `runners/_subprocess.py` — swappable `Launcher` Protocol (real `subprocess.run` default + test recorder) shared by the shell runners
+* `runners/python_runner.py` — in-process `runpy.run_path` for `.py` and `.sikuli` bundles; handles `SystemExit`, honours `silent`; pushes the script directory onto `sys.path` **and** `ImagePath` so `Pattern("btn.png")` resolves next to the script; tolerant of hosts where the numpy/opencv import fails
+* `runners/powershell_runner.py` — `powershell.exe` / `pwsh` with Sikuli's flag set (`-ExecutionPolicy Unrestricted -NonInteractive -NoLogo -NoProfile -WindowStyle Hidden -File`)
+* `runners/applescript_runner.py` — `osascript` for `.applescript`/`.scpt`/`.script`; macOS-only
+* `runners/bash_runner.py` — `bash`/`sh` for `.sh`/`.bash`; POSIX-only
+* `runners/robot_runner.py` — Robot Framework via `robot.run_cli(..., exit=False)`; `is_supported()` reflects whether the `runners` extra is installed
+* Built-ins auto-registered at import time; order: Python, PowerShell, AppleScript, Bash, Robot
+* Tests: 25 tests in `tests/test_phase6_runners.py` (24 passing + 1 host-skipped). Registry dispatch, PythonRunner in-process exec (`sys.argv`, `SystemExit`, bundle), subprocess runners verified via a recording launcher — no real PowerShell / osascript / bash needed on the host.
 
 ### Phase 7 — Flet IDE features
 * Tree-based `ScriptExplorer`

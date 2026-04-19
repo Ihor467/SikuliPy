@@ -1,8 +1,10 @@
 """Flet IDE entry point.
 
-This is a deliberately minimal skeleton — three panes, a toolbar, a status
-bar. Real editing, script execution, capture overlay, and the pattern
-sidebar are stubs for Phase 7.
+The Flet view is intentionally thin: it observes the headless models
+defined in :mod:`sikulipy.ide.editor`, :mod:`.console`, :mod:`.toolbar`,
+:mod:`.sidebar`, :mod:`.statusbar`, and :mod:`.explorer`, and renders
+their state. All real logic (undo/redo, run, capture, console capture)
+lives in those models so it can be unit-tested without Flet.
 
 Run::
 
@@ -13,56 +15,132 @@ Run::
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import flet as ft
 
 from sikulipy import __version__
+from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry
+from sikulipy.ide.editor import EditorDocument
+from sikulipy.ide.explorer import ScriptTreeNode, build_tree
+from sikulipy.ide.sidebar import SidebarModel
+from sikulipy.ide.statusbar import StatusModel
+from sikulipy.ide.toolbar import ToolbarActions
 
 
-def _build_toolbar(page: ft.Page) -> ft.Row:
-    def _stub(name: str):
+# ---------------------------------------------------------------------------
+# Application state container
+# ---------------------------------------------------------------------------
+
+
+class _IDEState:
+    """Bundle of model instances shared by the Flet widgets."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.document = EditorDocument()
+        self.console = ConsoleBuffer()
+        self.status = StatusModel()
+        self.sidebar = SidebarModel(self.document)
+        self.toolbar = ToolbarActions(
+            document=self.document,
+            on_status=self.status.set_message,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Widget builders
+# ---------------------------------------------------------------------------
+
+
+def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row:
+    def _wrap(action):
         def handler(_e):
-            page.snack_bar = ft.SnackBar(ft.Text(f"{name}: not implemented (Phase 7)"))
-            page.snack_bar.open = True
-            page.update()
+            try:
+                action()
+            except Exception as exc:
+                state.status.set_message(f"Error: {exc}")
+            refresh()
         return handler
 
     return ft.Row(
         controls=[
-            ft.ElevatedButton("Run",     icon=ft.Icons.PLAY_ARROW, on_click=_stub("Run")),
-            ft.ElevatedButton("Stop",    icon=ft.Icons.STOP,       on_click=_stub("Stop")),
-            ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_stub("Capture")),
-            ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_stub("New")),
-            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_stub("Open")),
-            ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_stub("Save")),
+            ft.ElevatedButton("Run",     icon=ft.Icons.PLAY_ARROW, on_click=_wrap(state.toolbar.run)),
+            ft.ElevatedButton("Stop",    icon=ft.Icons.STOP,       on_click=_wrap(state.toolbar.stop)),
+            ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_wrap(state.toolbar.begin_capture)),
+            ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
+            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=lambda _e: None),
+            ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
         ],
         spacing=8,
     )
 
 
-def _build_explorer() -> ft.Container:
+def _save_handler(state: _IDEState):
+    def _save():
+        if state.document.path is None:
+            target = state.root / "untitled.py"
+            state.document.save(target)
+        else:
+            state.document.save()
+        state.status.set_file(state.document.path, dirty=state.document.dirty)
+    return _save
+
+
+def _node_to_control(node: ScriptTreeNode, depth: int = 0) -> ft.Control:
+    icon = {
+        "dir": ft.Icons.FOLDER,
+        "bundle": ft.Icons.INVENTORY_2,
+        "script": ft.Icons.DESCRIPTION,
+        "image": ft.Icons.IMAGE,
+    }.get(node.kind, ft.Icons.INSERT_DRIVE_FILE)
+    row = ft.Row(
+        controls=[
+            ft.Container(width=depth * 12),
+            ft.Icon(icon, size=16),
+            ft.Text(node.name, size=13),
+        ],
+        spacing=4,
+    )
+    if node.is_leaf:
+        return row
+    return ft.Column(
+        controls=[row, *(_node_to_control(c, depth + 1) for c in node.children)],
+        spacing=2,
+    )
+
+
+def _build_explorer(state: _IDEState) -> ft.Container:
+    try:
+        tree = build_tree(state.root, include_images=True)
+        body = _node_to_control(tree)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        body = ft.Text(f"(no scripts: {exc})", italic=True, color=ft.Colors.GREY)
     return ft.Container(
         content=ft.Column(
             controls=[
                 ft.Text("Script Explorer", weight=ft.FontWeight.BOLD),
-                ft.Text("(tree view — Phase 7)", italic=True, color=ft.Colors.GREY),
-            ]
+                body,
+            ],
+            scroll=ft.ScrollMode.AUTO,
         ),
         padding=10,
         bgcolor=ft.Colors.GREY_100,
-        width=220,
+        width=240,
         expand=False,
     )
 
 
-def _build_editor() -> ft.Container:
+def _build_editor(state: _IDEState, refresh: callable) -> ft.Container:
+    def _on_change(e: ft.ControlEvent) -> None:
+        state.document.set_text(e.control.value)
+        state.status.set_file(state.document.path, dirty=state.document.dirty)
+        refresh()
+
     return ft.Container(
         content=ft.TextField(
-            value=(
-                "# SikuliPy script\n"
-                "from sikulipy import Screen, Pattern\n\n"
-                "s = Screen.get_primary()\n"
-                "s.click(Pattern('button.png').similar(0.85))\n"
-            ),
+            value=state.document.text,
+            on_change=_on_change,
             multiline=True,
             min_lines=20,
             max_lines=40,
@@ -74,13 +152,29 @@ def _build_editor() -> ft.Container:
     )
 
 
-def _build_sidebar() -> ft.Container:
+def _build_sidebar(state: _IDEState) -> ft.Container:
+    items = state.sidebar.items()
+    if not items:
+        body: ft.Control = ft.Text(
+            "(no patterns)", italic=True, color=ft.Colors.GREY
+        )
+    else:
+        rows = []
+        for it in items:
+            colour = ft.Colors.BLACK if it.exists else ft.Colors.RED
+            rows.append(
+                ft.Row(
+                    controls=[
+                        ft.Icon(ft.Icons.IMAGE, size=16, color=colour),
+                        ft.Text(it.name, size=13, color=colour),
+                    ],
+                    spacing=6,
+                )
+            )
+        body = ft.Column(controls=rows, scroll=ft.ScrollMode.AUTO)
     return ft.Container(
         content=ft.Column(
-            controls=[
-                ft.Text("Patterns", weight=ft.FontWeight.BOLD),
-                ft.Text("(captured images — Phase 7)", italic=True, color=ft.Colors.GREY),
-            ]
+            controls=[ft.Text("Patterns", weight=ft.FontWeight.BOLD), body]
         ),
         padding=10,
         bgcolor=ft.Colors.GREY_100,
@@ -89,34 +183,36 @@ def _build_sidebar() -> ft.Container:
     )
 
 
-def _build_console() -> ft.Container:
+def _build_console(state: _IDEState) -> ft.Container:
+    text = state.console.text() or f"SikuliPy {__version__} — ready."
     return ft.Container(
         content=ft.Column(
             controls=[
                 ft.Text("Console", weight=ft.FontWeight.BOLD),
-                ft.Text(f"SikuliPy {__version__} — ready.", selectable=True),
-            ]
+                ft.Text(text, selectable=True, font_family="monospace", size=12),
+            ],
+            scroll=ft.ScrollMode.AUTO,
         ),
         padding=10,
         bgcolor=ft.Colors.BLACK12,
-        height=140,
+        height=160,
     )
 
 
-def _build_statusbar() -> ft.Container:
+def _build_statusbar(state: _IDEState) -> ft.Container:
     return ft.Container(
         content=ft.Row(
-            controls=[
-                ft.Text(f"SikuliPy {__version__}", size=12),
-                ft.Text(" · ", size=12),
-                ft.Text("Python 3.14", size=12),
-                ft.Text(" · ", size=12),
-                ft.Text("Flet IDE (skeleton)", size=12, italic=True),
-            ]
+            controls=[ft.Text(seg, size=12) for seg in state.status.segments()],
+            spacing=10,
         ),
         padding=ft.padding.symmetric(horizontal=10, vertical=4),
         bgcolor=ft.Colors.BLUE_GREY_100,
     )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def ide_main(page: ft.Page) -> None:
@@ -125,22 +221,34 @@ def ide_main(page: ft.Page) -> None:
     page.window_height = 800
     page.padding = 0
 
-    page.add(
-        ft.Column(
-            controls=[
-                ft.Container(_build_toolbar(page), padding=10, bgcolor=ft.Colors.GREY_200),
-                ft.Row(
-                    controls=[_build_explorer(), _build_editor(), _build_sidebar()],
-                    expand=True,
-                    spacing=0,
-                ),
-                _build_console(),
-                _build_statusbar(),
-            ],
-            expand=True,
-            spacing=0,
-        )
-    )
+    state = _IDEState(root=Path.cwd())
+
+    # The whole layout is rebuilt on refresh — fine for this skeleton;
+    # later phases can switch to fine-grained updates.
+    container = ft.Column(expand=True, spacing=0)
+
+    def refresh() -> None:
+        container.controls = [
+            ft.Container(_build_toolbar(state, page, refresh), padding=10, bgcolor=ft.Colors.GREY_200),
+            ft.Row(
+                controls=[
+                    _build_explorer(state),
+                    _build_editor(state, refresh),
+                    _build_sidebar(state),
+                ],
+                expand=True,
+                spacing=0,
+            ),
+            _build_console(state),
+            _build_statusbar(state),
+        ]
+        page.update()
+
+    # Pipe console writes back into the UI.
+    state.console.subscribe(lambda _entry: refresh())
+
+    page.add(container)
+    refresh()
 
 
 def main() -> None:

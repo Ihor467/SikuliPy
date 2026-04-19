@@ -40,6 +40,8 @@ android = [
 ]
 vnc = [
     "vncdotool>=1.2",
+    "sshtunnel>=0.4",
+    "paramiko>=3.4",
 ]
 runners = [
     "robotframework>=7.0",
