@@ -91,6 +91,15 @@ class Region(Element):
     def is_valid(self) -> bool:
         return self.w > 0 and self.h > 0
 
+    # ---- Highlight --------------------------------------------------
+    def highlight(self, seconds: float = 2.0, color: str = "red"):
+        """Briefly outline this region (Phase 8 guide overlay)."""
+        from sikulipy.util.highlight import Highlight
+
+        hl = Highlight(self, color=color, duration=seconds)
+        hl.show()
+        return hl
+
     # ---- Capture helper ---------------------------------------------
     def _capture_bgr(self):
         """Grab this region's pixels as a BGR numpy array via Screen/mss."""

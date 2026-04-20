@@ -101,17 +101,41 @@ permissions. `mss` handles both but Wayland may need `pipewire` fallback.
 * Built-ins auto-registered at import time; order: Python, PowerShell, AppleScript, Bash, Robot
 * Tests: 25 tests in `tests/test_phase6_runners.py` (24 passing + 1 host-skipped). Registry dispatch, PythonRunner in-process exec (`sys.argv`, `SystemExit`, bundle), subprocess runners verified via a recording launcher — no real PowerShell / osascript / bash needed on the host.
 
-### Phase 7 — Flet IDE features
-* Tree-based `ScriptExplorer`
-* Pattern capture overlay (replaces `OverlayCapturePrompt.java`)
-* Inline pattern thumbnails in the editor (likely via embedded Monaco/CodeMirror in a `WebView`)
-* Console pane with stdout/stderr redirection
-* Recorder (`recorder/`) producing ready-to-run scripts
+### Phase 7 — Flet IDE features ✅
+Every IDE concern is modelled headlessly so it can be unit-tested without
+Flet; `ide/app.py` is a thin view that binds Flet widgets to those models.
 
-### Phase 8 — Native helpers + Guides
-* Window management (`App.java`) per-platform
-* `guide/` overlays (SxArrow, SxCallout, SxSpotlight) as transparent
-  Flet windows or Tk overlays
+* `ide/explorer.py` — `ScriptTreeNode` + `build_tree()` (ports `ScriptExplorer`); classifies dirs / `*.sikuli` bundles / scripts / images; dirs sorted first, then files (case-insensitive); bundles exposed as leaves but can surface their image children
+* `ide/editor.py` — `EditorDocument` (ports `EditorPane` state): buffer + cursor + dirty flag, 100-entry undo/redo stack, `insert`/`delete_range`/`set_text`, `open`/`save`, regex-based pattern-reference scanner (`Pattern("x.png")` calls + bare image literals), `pattern_absolute_paths()` resolving against the document folder
+* `ide/console.py` — `ConsoleBuffer` ring buffer (deque-backed, configurable cap, subscriber callbacks) + `ConsoleRedirect` context manager swapping `sys.stdout`/`sys.stderr` for forwarding proxies with ANSI (`CSI`/`OSC`) stripping; optional `tee` keeps the original streams attached
+* `ide/capture.py` — `CaptureSession` state machine (idle → selecting → captured / cancelled) + `CaptureRect.from_corners` normalising drag direction; `save()` crops the held BGR ndarray via `cv2.imwrite` (guarded so the model still imports on hosts without cv2)
+* `ide/toolbar.py` — `ToolbarActions(document, runner, capture, on_status)` bridging buttons to models: `new`/`open`/`save`/`run`/`stop`/`begin_capture`; default `_DefaultRunnerHost` dispatches through `sikulipy.runners.run_file` on a daemon thread; swappable `RunnerHost` Protocol so tests inject a fake
+* `ide/sidebar.py` — `SidebarModel` merging pattern references from the editor buffer with user-captured PNGs; `SidebarItem` carries `exists` so the Flet view can grey out broken references
+* `ide/statusbar.py` — `StatusModel` with file-label / dirty-marker / cursor / runner / message segments, rendered to a single separator-joined string
+* `ide/app.py` — Flet view rebuilt on refresh; toolbar, explorer tree (recursive icon-prefixed rows), editor `TextField` bound to `EditorDocument.set_text`, pattern sidebar, console pane (subscribed to `ConsoleBuffer`), status bar row
+* `recorder/__init__.py` — `ActionRecorder` with swappable `InputListener` Protocol (default `_PynputListener`; tests inject a fake); collects click / double-click / right-click / typed-text / wait events (wait auto-inserted when the gap ≥ 0.5 s); optional `screenshotter` + `pattern_dir` crop a PNG around each click; `generate_script()` synthesises runnable `sikulipy` source using `screen.click(Pattern(...))` / `screen.type(...)` / `time.sleep(...)`
+* Tests: 30 tests — 23 in `tests/test_phase7_ide.py` (explorer, editor, console, capture, sidebar, statusbar, toolbar with fake runner, smoke-import of `app.py`), 7 in `tests/test_phase7_recorder.py` (fake listener + injected clock, script generation, pattern capture gating). Full suite: **131 passed, 3 skipped** (skips are all host-CPU constraints, not Phase 7).
+
+### Phase 8 — Native helpers + Guides ✅
+Both subsystems follow the now-familiar Protocol + lazy-singleton +
+test-fake pattern. Platform SDKs (`pywin32`, `pyobjc`, `python-xlib`,
+`ewmh`) live behind a new `app` pyproject extra so the core install
+stays lean and headless CI never triggers them.
+
+* `natives/_backend.py` — `WindowManagerBackend` Protocol + `get_backend()` / `set_backend()`; auto-resolves `_Win32Backend` (Windows), `_MacOSBackend` (macOS), `_LinuxBackend` (Linux with `DISPLAY`), otherwise `_NullBackend`
+* `natives/types.py` — `WindowInfo(pid, title, bounds, handle)` + `NotSupportedError`
+* `natives/_win32.py` — `EnumWindows` + `SetForegroundWindow`; PID resolved via `win32process.GetWindowThreadProcessId`
+* `natives/_macos.py` — `CGWindowListCopyWindowInfo` + `NSRunningApplication.activateWithOptions_`; launches via `open -a`
+* `natives/_linux.py` — `ewmh.EWMH` + `_NET_CLIENT_LIST` enumeration; translates to absolute screen coords via `translate_coords`
+* `natives/_null.py` — queries return empty; `close`/`focus` raise `NotSupportedError`; `open` falls back to `subprocess.Popen` so launch-only scripts still work on a headless box
+* `natives/app.py` — `App(name, pid)` facade with `open`/`focused`/`find` classmethods, `focus`/`close`/`is_running` instance methods, `windows()` / `window(n)` (returns `Region` lazily to avoid forcing numpy), `all_windows()` class-level snapshot
+* `guide/shapes.py` — `Rectangle`, `Arrow`, `Callout`, `Spotlight`, `Text` dataclasses implementing a `Shape` Protocol; `bounds()` + `draw(canvas)` (cv2-guarded so shape objects still import on hosts without it); named-colour table with BGR fallback to red
+* `guide/_backend.py` — `GuideBackend` Protocol + `_NullGuideBackend` (records calls, sleeps for blocking `duration`) + `_FletGuideBackend` (frameless, always-on-top, transparent Flet window; composes shapes via `cv2.imencode` → base64 `ft.Image`); auto-resolves based on cv2/flet availability
+* `guide/__init__.py` — fluent `Guide` builder: `arrow()`, `rectangle()`, `callout()`, `spotlight()`, `text()`, `clear()`; `show(duration=...)` and `hide()` dispatch through `get_backend()`
+* `util/highlight.py` — `Highlight(region, color, duration)` delegates to `Guide.rectangle(...).show()`; context-manager API (`with Highlight(...)`)
+* `core/region.py` — `Region.highlight(seconds=2.0, color="red")` convenience method
+* `pyproject.toml` — new `app` extra (`pywin32` / `pyobjc-framework-{Cocoa,Quartz}` / `python-xlib` + `ewmh`, each environment-marker-gated)
+* Tests: 26 tests in `tests/test_phase8_natives.py` + `tests/test_phase8_guide.py`; routing verified with `RecordingBackend` / `RecordingGuideBackend`; cv2-based pixel assertions gated on `pytest.importorskip("cv2", exc_type=ImportError)` so the suite still passes on CPUs without NumPy 2.x support.
 
 ## Out of scope (for now)
 

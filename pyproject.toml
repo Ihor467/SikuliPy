@@ -46,6 +46,13 @@ vnc = [
 runners = [
     "robotframework>=7.0",
 ]
+app = [
+    "pywin32>=306 ; platform_system == 'Windows'",
+    "pyobjc-framework-Cocoa>=10.0 ; platform_system == 'Darwin'",
+    "pyobjc-framework-Quartz>=10.0 ; platform_system == 'Darwin'",
+    "python-xlib>=0.33 ; platform_system == 'Linux'",
+    "ewmh>=0.1.6 ; platform_system == 'Linux'",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
