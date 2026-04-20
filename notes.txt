@@ -1,0 +1,29 @@
+ uv run sikulipy-ide is equivalent to running a Python function, just declared as a console script entry point.                                                                                                                            
+                                                                                                                                                                                                                                            
+  The chain:                                                                                                                                                                                                                                
+   
+  1. pyproject.toml declares the entry point:                                                                                                                                                                                               
+  [project.scripts]                                                                       
+  sikulipy-ide = "sikulipy.ide.app:main" 
+  1. This tells the installer: "create a shell command sikulipy-ide that calls main() from sikulipy/ide/app.py."
+  2. When the package is installed, pip/uv generates a tiny shim script in .venv/bin/sikulipy-ide that does essentially:                                                                                                                    
+  from sikulipy.ide.app import main                                                                                                                                                                                                         
+  main()                                                                                                                                                                                                                                    
+  3. uv run sikulipy-ide just:                                                                                                                                                                                                              
+    - ensures the venv is synced (installs deps if needed),                                                                                                                                                                                 
+    - activates the venv's PATH,                                                                                                                                                                                                            
+    - runs the shim.                                                                                                                                                                                                                        
+  4. The shim calls main() at src/sikulipy/ide/app.py:202-204, which is simply:                                                                                                                                                             
+  def main() -> None:                                                                                                                                                                                                                       
+      ft.app(target=ide_main)                                                             
+                                                                                                                                                                                                                                            
+  Equivalents — all four do the same thing:                                                                                                                                                                                                 
+                                                                                                                                                                                                                                            
+  uv run sikulipy-ide                        # via console-script shim                                                                                                                                                                      
+  uv run python -m sikulipy.ide.app          # runs the `if __name__ == "__main__"` block 
+  uv run python src/sikulipy/ide/app.py      # direct file path                                                                                                                                                                             
+  uv run python -c "from sikulipy.ide.app import main; main()"                                                                                                                                                                              
+                                                                                                                                                                                                                                            
+  Why the entry-point style? It ships a command on the user's PATH once they pip install sikulipy — no need to know the internal module layout. It's the standard way Python apps expose CLIs (think pytest, black, uv itself).             
+                                                                                                                                                                                                                                            
+  If you prefer a main.py style, there's no main.py in this project — the IDE entry is src/sikulipy/ide/app.py and the CLI entry is src/sikulipy/cli.py (registered as sikulipy).  

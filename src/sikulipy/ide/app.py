@@ -46,6 +46,10 @@ class _IDEState:
             document=self.document,
             on_status=self.status.set_message,
         )
+        # Paths of directories currently expanded in the explorer tree.
+        # Root is expanded by default so the top-level is immediately
+        # visible.
+        self.expanded_dirs: set[Path] = {root.resolve()}
 
 
 # ---------------------------------------------------------------------------
@@ -87,33 +91,90 @@ def _save_handler(state: _IDEState):
     return _save
 
 
-def _node_to_control(node: ScriptTreeNode, depth: int = 0) -> ft.Control:
+def _node_to_control(
+    node: ScriptTreeNode,
+    state: _IDEState,
+    refresh: callable,
+    depth: int = 0,
+) -> ft.Control:
     icon = {
         "dir": ft.Icons.FOLDER,
         "bundle": ft.Icons.INVENTORY_2,
         "script": ft.Icons.DESCRIPTION,
         "image": ft.Icons.IMAGE,
     }.get(node.kind, ft.Icons.INSERT_DRIVE_FILE)
-    row = ft.Row(
+
+    is_dir = node.kind == "dir"
+    is_expanded = node.path.resolve() in state.expanded_dirs
+
+    if is_dir:
+        chevron = ft.Icon(
+            ft.Icons.KEYBOARD_ARROW_DOWN if is_expanded else ft.Icons.KEYBOARD_ARROW_RIGHT,
+            size=16,
+        )
+    else:
+        # Leaf nodes get a blank spacer so file names align with dir names.
+        chevron = ft.Container(width=16)
+
+    row_content = ft.Row(
         controls=[
             ft.Container(width=depth * 12),
+            chevron,
             ft.Icon(icon, size=16),
             ft.Text(node.name, size=13),
         ],
         spacing=4,
     )
-    if node.is_leaf:
+
+    def _on_click(_e, path=node.path.resolve()):
+        if path in state.expanded_dirs:
+            state.expanded_dirs.discard(path)
+        else:
+            state.expanded_dirs.add(path)
+        refresh()
+
+    def _on_open_file(_e, path=node.path):
+        try:
+            state.toolbar.open(path)
+            state.status.set_file(state.document.path, dirty=False)
+        except Exception as exc:
+            state.status.set_message(f"Open failed: {exc}")
+        refresh()
+
+    if is_dir:
+        row: ft.Control = ft.GestureDetector(
+            content=row_content,
+            on_tap=_on_click,
+            mouse_cursor=ft.MouseCursor.CLICK,
+        )
+    elif node.kind in ("script", "bundle"):
+        row = ft.GestureDetector(
+            content=row_content,
+            on_tap=_on_open_file,
+            mouse_cursor=ft.MouseCursor.CLICK,
+        )
+    else:
+        row = row_content
+
+    if not is_dir or not is_expanded:
         return row
+
     return ft.Column(
-        controls=[row, *(_node_to_control(c, depth + 1) for c in node.children)],
+        controls=[
+            row,
+            *(
+                _node_to_control(c, state, refresh, depth + 1)
+                for c in node.children
+            ),
+        ],
         spacing=2,
     )
 
 
-def _build_explorer(state: _IDEState) -> ft.Container:
+def _build_explorer(state: _IDEState, refresh: callable) -> ft.Container:
     try:
         tree = build_tree(state.root, include_images=True)
-        body = _node_to_control(tree)
+        body = _node_to_control(tree, state, refresh)
     except (FileNotFoundError, NotADirectoryError) as exc:
         body = ft.Text(f"(no scripts: {exc})", italic=True, color=ft.Colors.GREY)
     return ft.Container(
@@ -123,6 +184,9 @@ def _build_explorer(state: _IDEState) -> ft.Container:
                 body,
             ],
             scroll=ft.ScrollMode.AUTO,
+            alignment=ft.MainAxisAlignment.START,
+            horizontal_alignment=ft.CrossAxisAlignment.START,
+            expand=True,
         ),
         padding=10,
         bgcolor=ft.Colors.GREY_100,
@@ -232,12 +296,13 @@ def ide_main(page: ft.Page) -> None:
             ft.Container(_build_toolbar(state, page, refresh), padding=10, bgcolor=ft.Colors.GREY_200),
             ft.Row(
                 controls=[
-                    _build_explorer(state),
+                    _build_explorer(state, refresh),
                     _build_editor(state, refresh),
                     _build_sidebar(state),
                 ],
                 expand=True,
                 spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             _build_console(state),
             _build_statusbar(state),
