@@ -67,17 +67,64 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
         return handler
 
+    picker = _ensure_file_picker(state, page, refresh)
+
+    async def _open_click(_e):
+        state.status.set_message("Opening folder picker...")
+        refresh()
+        try:
+            folder = await picker.get_directory_path(
+                dialog_title="Open project folder",
+                initial_directory=str(state.root),
+            )
+        except Exception as exc:
+            state.status.set_message(f"Picker failed: {exc!r}")
+            refresh()
+            return
+        if not folder:
+            state.status.set_message("Open cancelled")
+            refresh()
+            return
+        new_root = Path(folder).resolve()
+        state.root = new_root
+        state.expanded_dirs = {new_root}
+        state.status.set_message(f"Project: {new_root}")
+        refresh()
+
     return ft.Row(
         controls=[
             ft.ElevatedButton("Run",     icon=ft.Icons.PLAY_ARROW, on_click=_wrap(state.toolbar.run)),
             ft.ElevatedButton("Stop",    icon=ft.Icons.STOP,       on_click=_wrap(state.toolbar.stop)),
             ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_wrap(state.toolbar.begin_capture)),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
-            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=lambda _e: None),
+            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
         ],
         spacing=8,
     )
+
+
+def _ensure_file_picker(
+    state: _IDEState, page: ft.Page, refresh: callable
+) -> ft.FilePicker:
+    """Attach a single :class:`ft.FilePicker` to the page; reuse it across refreshes.
+
+    Flet's current FilePicker has no ``on_result`` hook — ``pick_files`` is
+    an async method that returns the selection directly. We just cache the
+    picker instance here so we don't stack a new one on every refresh.
+    """
+    picker = getattr(state, "_file_picker", None)
+    if picker is not None:
+        return picker
+
+    picker = ft.FilePicker()
+    # Current Flet registers FilePicker as a Service on the page, not
+    # as an overlay control. Adding it to page.overlay yields
+    # "Unknown control: FilePicker" and breaks pick_files().
+    page.services.append(picker)
+    page.update()
+    state._file_picker = picker  # type: ignore[attr-defined]
+    return picker
 
 
 def _save_handler(state: _IDEState):
