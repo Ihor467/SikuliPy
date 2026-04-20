@@ -15,6 +15,8 @@ Run::
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import flet as ft
@@ -67,16 +69,9 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
         return handler
 
-    picker = _ensure_file_picker(state, page, refresh)
-
-    async def _open_click(_e):
-        state.status.set_message("Opening folder picker...")
-        refresh()
+    def _open_click(_e):
         try:
-            folder = await picker.get_directory_path(
-                dialog_title="Open project folder",
-                initial_directory=str(state.root),
-            )
+            folder = _pick_directory(str(state.root))
         except Exception as exc:
             state.status.set_message(f"Picker failed: {exc!r}")
             refresh()
@@ -104,27 +99,45 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
     )
 
 
-def _ensure_file_picker(
-    state: _IDEState, page: ft.Page, refresh: callable
-) -> ft.FilePicker:
-    """Attach a single :class:`ft.FilePicker` to the page; reuse it across refreshes.
+def _pick_directory(initial: str) -> str | None:
+    """Show a native folder picker, returning the chosen path or None.
 
-    Flet's current FilePicker has no ``on_result`` hook — ``pick_files`` is
-    an async method that returns the selection directly. We just cache the
-    picker instance here so we don't stack a new one on every refresh.
+    Flet's built-in ``FilePicker.get_directory_path`` shells out to
+    ``zenity`` on Linux; on KDE or any host without zenity installed,
+    the call hangs indefinitely. We sidestep Flet entirely and probe
+    for a working native helper in this order:
+
+    1. ``kdialog --getexistingdirectory`` (KDE Plasma)
+    2. ``zenity --file-selection --directory`` (GNOME / generic)
+    3. ``tkinter.filedialog.askdirectory`` (cross-platform Python-only)
+
+    The helpers below all block until the user picks or cancels.
     """
-    picker = getattr(state, "_file_picker", None)
-    if picker is not None:
-        return picker
-
-    picker = ft.FilePicker()
-    # Current Flet registers FilePicker as a Service on the page, not
-    # as an overlay control. Adding it to page.overlay yields
-    # "Unknown control: FilePicker" and breaks pick_files().
-    page.services.append(picker)
-    page.update()
-    state._file_picker = picker  # type: ignore[attr-defined]
-    return picker
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--getexistingdirectory", initial],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [zenity, "--file-selection", "--directory",
+             f"--filename={initial}/", "--title=Open project folder"],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    # Tkinter fallback (Windows/macOS/Linux without zenity or kdialog).
+    import tkinter
+    from tkinter import filedialog
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        path = filedialog.askdirectory(
+            title="Open project folder", initialdir=initial
+        )
+    finally:
+        root.destroy()
+    return path or None
 
 
 def _save_handler(state: _IDEState):
