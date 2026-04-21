@@ -8,6 +8,7 @@ model tests plus a smoke import.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import build_tree, classify
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
-from sikulipy.ide.toolbar import ToolbarActions
+from sikulipy.ide.toolbar import DefaultRunnerHost, ToolbarActions
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +434,47 @@ def test_toolbar_begin_capture_resets_session():
     assert tb.capture.state == "captured"
     tb.begin_capture()
     assert tb.capture.state == "idle"
+
+
+def _wait_runner(runner: DefaultRunnerHost, timeout: float = 2.0) -> None:
+    """Block until the runner's background thread finishes (or timeout)."""
+    deadline = time.monotonic() + timeout
+    while runner.is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not runner.is_running(), "runner thread did not finish in time"
+
+
+def test_default_runner_captures_stdout_and_stderr(tmp_path: Path):
+    script = tmp_path / "demo.py"
+    script.write_text(
+        "import sys\n"
+        "print('hello from script')\n"
+        "print('oops', file=sys.stderr)\n"
+    )
+    buf = ConsoleBuffer()
+    runner = DefaultRunnerHost(console=buf)
+    runner.run(script)
+    _wait_runner(runner)
+    streams = {e.stream for e in buf.entries()}
+    assert streams == {"stdout", "stderr"}
+    assert "hello from script\n" in buf.text()
+    assert "oops\n" in buf.text()
+
+
+def test_default_runner_captures_tracebacks(tmp_path: Path):
+    script = tmp_path / "boom.py"
+    script.write_text("raise RuntimeError('nope')\n")
+    buf = ConsoleBuffer()
+    runner = DefaultRunnerHost(console=buf)
+    runner.run(script)
+    _wait_runner(runner)
+    text = buf.text()
+    assert "Traceback" in text
+    assert "RuntimeError: nope" in text
+    # The thread shouldn't have re-raised past the host — it should have
+    # printed the traceback through the redirected stderr and set an
+    # error exit code.
+    assert runner._exit_code == 1
 
 
 # ---------------------------------------------------------------------------

@@ -12,11 +12,13 @@ process.
 from __future__ import annotations
 
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
 from sikulipy.ide.capture import CaptureSession
+from sikulipy.ide.console import ConsoleBuffer, ConsoleRedirect
 from sikulipy.ide.editor import EditorDocument
 
 
@@ -29,9 +31,17 @@ class RunnerHost(Protocol):
 
 
 @dataclass
-class _DefaultRunnerHost:
-    """Background-thread runner that calls :func:`sikulipy.runners.run_file`."""
+class DefaultRunnerHost:
+    """Background-thread runner that calls :func:`sikulipy.runners.run_file`.
 
+    When ``console`` is provided, stdout/stderr from the running script
+    (including any uncaught traceback) are redirected into the given
+    :class:`ConsoleBuffer` via :class:`ConsoleRedirect`, so the IDE's
+    console pane shows script output instead of the terminal that
+    launched the IDE.
+    """
+
+    console: ConsoleBuffer | None = None
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _exit_code: int | None = field(default=None, init=False, repr=False)
 
@@ -43,12 +53,24 @@ class _DefaultRunnerHost:
 
         self._exit_code = None
 
-        def _target() -> None:
+        def _body() -> None:
             try:
                 self._exit_code = run_file(str(path))
-            except BaseException as exc:  # pragma: no cover
+            except BaseException:
+                # Route the traceback through the (possibly redirected)
+                # sys.stderr so it lands in the IDE console rather than
+                # the launching terminal. Re-raising here would just be
+                # swallowed by the thread with a "Exception in thread …"
+                # banner on the real stderr — no help to the user.
                 self._exit_code = 1
-                raise exc
+                traceback.print_exc()
+
+        def _target() -> None:
+            if self.console is not None:
+                with ConsoleRedirect(self.console, tee=True):
+                    _body()
+            else:
+                _body()
 
         self._thread = threading.Thread(target=_target, daemon=True)
         self._thread.start()
@@ -69,7 +91,7 @@ class ToolbarActions:
     """Bridges UI buttons to editor + runner + capture state."""
 
     document: EditorDocument
-    runner: RunnerHost = field(default_factory=_DefaultRunnerHost)
+    runner: RunnerHost = field(default_factory=DefaultRunnerHost)
     capture: CaptureSession = field(default_factory=CaptureSession)
     on_open: Callable[[Path], None] | None = None
     on_status: Callable[[str], None] | None = None

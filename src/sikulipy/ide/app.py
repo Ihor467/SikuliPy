@@ -28,7 +28,7 @@ from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import ScriptTreeNode, build_tree
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
-from sikulipy.ide.toolbar import ToolbarActions
+from sikulipy.ide.toolbar import DefaultRunnerHost, ToolbarActions
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,7 @@ class _IDEState:
         self.sidebar = SidebarModel(self.document)
         self.toolbar = ToolbarActions(
             document=self.document,
+            runner=DefaultRunnerHost(console=self.console),
             on_status=self.status.set_message,
         )
         # Paths of directories currently expanded in the explorer tree.
