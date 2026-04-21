@@ -272,11 +272,12 @@ def _build_editor(
     refresh: callable,
     refresh_statusbar: callable,
 ) -> ft.Container:
-    # Track the dirty state we last rendered so we only do a *full* layout
-    # rebuild when something structural changed. Rebuilding on every
-    # keystroke rips the TextField out of the tree, which drops focus
-    # after each character.
-    last_dirty = [state.document.dirty]
+    # Never do a full layout rebuild in response to typing: that would
+    # swap the TextField out of the tree and drop focus. The dirty
+    # marker and cursor position both live in the status bar, which
+    # updates fine-grained. The pattern sidebar stays stale until some
+    # other action (save, open, run) triggers a full refresh — fine
+    # trade-off for keeping focus on every keystroke.
 
     def _update_caret(control: ft.TextField) -> None:
         sel = control.selection
@@ -288,11 +289,7 @@ def _build_editor(
         state.document.set_text(e.control.value)
         state.status.set_file(state.document.path, dirty=state.document.dirty)
         _update_caret(e.control)
-        if state.document.dirty != last_dirty[0]:
-            last_dirty[0] = state.document.dirty
-            refresh()
-        else:
-            refresh_statusbar()
+        refresh_statusbar()
 
     def _on_selection_change(e: ft.ControlEvent) -> None:
         _update_caret(e.control)
