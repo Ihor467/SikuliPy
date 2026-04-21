@@ -117,6 +117,28 @@ def test_editor_save_and_open_roundtrip(tmp_path: Path):
     assert reopened.path == target.resolve()
 
 
+def test_editor_open_resolves_sikuli_bundle(tmp_path: Path):
+    bundle = tmp_path / "demo.sikuli"
+    bundle.mkdir()
+    inner = bundle / "demo.py"
+    inner.write_text("print('from bundle')\n")
+
+    doc = EditorDocument.open(bundle)
+    assert doc.text == "print('from bundle')\n"
+    assert doc.path == inner.resolve()
+
+
+def test_editor_open_sikuli_bundle_falls_back_to_any_py(tmp_path: Path):
+    bundle = tmp_path / "demo.sikuli"
+    bundle.mkdir()
+    inner = bundle / "other.py"
+    inner.write_text("x = 1\n")
+
+    doc = EditorDocument.open(bundle)
+    assert doc.text == "x = 1\n"
+    assert doc.path == inner.resolve()
+
+
 def test_editor_pattern_references_are_deduped_and_ordered():
     doc = EditorDocument(text=(
         "Pattern('a.png')\n"
@@ -255,10 +277,27 @@ def test_capture_overlay_pick_region_and_save_writes_png(
     assert out == (tmp_path / "assets" / "button.png").resolve()
     assert out.exists()
 
-    # Filename collision should produce -1, -2, ...
+    # On collision the user is prompted. "rename" auto-suffixes to -1/-2/...
+    monkeypatch.setattr(
+        capture_overlay, "_ask_overwrite", lambda target: "rename"
+    )
     out2 = capture_overlay.pick_region_and_save(tmp_path)
     assert out2 is not None
     assert out2.name == "button-1.png"
+
+    # "overwrite" reuses the original name, replacing the old file.
+    monkeypatch.setattr(
+        capture_overlay, "_ask_overwrite", lambda target: "overwrite"
+    )
+    out3 = capture_overlay.pick_region_and_save(tmp_path)
+    assert out3 is not None
+    assert out3.name == "button.png"
+
+    # Cancelling the overwrite prompt returns None and writes nothing new.
+    before = sorted((tmp_path / "assets").iterdir())
+    monkeypatch.setattr(capture_overlay, "_ask_overwrite", lambda target: None)
+    assert capture_overlay.pick_region_and_save(tmp_path) is None
+    assert sorted((tmp_path / "assets").iterdir()) == before
 
     # User cancels the overlay → no file, None returned.
     monkeypatch.setattr(capture_overlay, "_run_overlay", lambda img: None)

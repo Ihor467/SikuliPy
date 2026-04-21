@@ -17,6 +17,24 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+def _resolve_bundle(path: Path) -> Path:
+    """Map a ``foo.sikuli`` folder to its inner ``foo.py`` script.
+
+    SikuliX stores each script as a bundle directory (``foo.sikuli``)
+    holding a same-stem ``.py`` file plus its pattern images. The IDE
+    treats the bundle as a single openable unit; everything else
+    (non-bundle paths, plain files) passes through unchanged.
+    """
+    if path.is_dir() and path.suffix.lower() == ".sikuli":
+        candidate = path / f"{path.stem}.py"
+        if candidate.is_file():
+            return candidate
+        for child in sorted(path.iterdir()):
+            if child.is_file() and child.suffix.lower() == ".py":
+                return child
+    return path
+
+
 _PATTERN_CALL_RE = re.compile(
     r"""Pattern\s*\(\s*               # Pattern(
         ['"](?P<path>[^'"]+)['"]      # "…"
@@ -57,7 +75,7 @@ class EditorDocument:
     # ---- Loading / saving ------------------------------------------
     @classmethod
     def open(cls, path: str | Path) -> "EditorDocument":
-        p = Path(path)
+        p = _resolve_bundle(Path(path))
         text = p.read_text(encoding="utf-8") if p.exists() else ""
         return cls(text=text, path=p.resolve(), cursor=0, dirty=False)
 

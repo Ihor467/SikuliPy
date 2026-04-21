@@ -155,6 +155,88 @@ def _ask_filename(default: str = "capture") -> str | None:
     return name or None
 
 
+def _ask_overwrite(target: Path) -> str | None:
+    """Ask what to do when ``target`` already exists.
+
+    Returns one of ``"overwrite"``, ``"rename"``, or ``None`` (cancel).
+    ``"rename"`` means the caller should pick a non-colliding ``…-N.png``
+    name; ``"overwrite"`` replaces the existing file.
+
+    Probes native helpers in the same order as
+    :func:`sikulipy.ide.app._pick_directory` (kdialog → zenity → tk)
+    because Tk's own ``messagebox`` window tends to appear behind other
+    windows on KDE when its parent is ``withdraw()``-ed, making the
+    dialog effectively invisible.
+    """
+    import shutil
+    import subprocess
+
+    prompt = (
+        f"{target.name} already exists in {target.parent}.\n\n"
+        "Overwrite the existing file?\n"
+        "  Yes     → overwrite\n"
+        "  No      → save with a numeric suffix (e.g. -1.png)\n"
+        "  Cancel  → discard the capture"
+    )
+
+    # kdialog: --warningyesnocancel gives us three buttons. Return codes
+    # are 0 = Yes, 1 = No, 2 = Cancel (matches KDE convention).
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--title", "File exists", "--warningyesnocancel", prompt],
+        )
+        if r.returncode == 0:
+            return "overwrite"
+        if r.returncode == 1:
+            return "rename"
+        return None
+
+    # zenity has no native 3-button dialog; emulate one with --question
+    # and custom button labels. Return codes: 0 = Overwrite (ok-label),
+    # 1 = Rename (cancel-label), 5 = timeout/closed → treat as cancel.
+    # We use --extra-button to add the third option; zenity prints the
+    # extra-button label on stdout when clicked.
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [
+                zenity, "--question", "--title=File exists",
+                f"--text={prompt}",
+                "--ok-label=Overwrite",
+                "--cancel-label=Cancel",
+                "--extra-button=Rename",
+            ],
+            capture_output=True, text=True,
+        )
+        if r.stdout.strip() == "Rename":
+            return "rename"
+        if r.returncode == 0:
+            return "overwrite"
+        return None
+
+    # Tk fallback. askyesnocancel only has Yes/No/Cancel (no custom
+    # labels), so the prompt above spells out the mapping.
+    import tkinter as tk
+    from tkinter import messagebox
+
+    root = tk.Tk()
+    root.withdraw()
+    # Force the dialog above other windows — withdrawn-parent messageboxes
+    # otherwise get hidden behind the overlay/IDE on some Linux WMs.
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    try:
+        answer = messagebox.askyesnocancel(
+            "File exists", prompt, parent=root,
+        )
+    finally:
+        root.destroy()
+    if answer is None:
+        return None
+    return "overwrite" if answer else "rename"
+
+
 def _safe_stem(name: str) -> str:
     """Strip path separators and any trailing .png so we always land on disk."""
     base = Path(name).name  # drop any directory components
@@ -199,11 +281,18 @@ def pick_region_and_save(project_root: Path) -> Path | None:
     assets = Path(project_root).resolve() / "assets"
     assets.mkdir(parents=True, exist_ok=True)
     target = assets / f"{stem}.png"
-    # If the name collides, append -1, -2, ... so we don't silently
-    # overwrite a prior capture.
-    i = 1
-    while target.exists():
-        target = assets / f"{stem}-{i}.png"
-        i += 1
+    # Collision: ask the user whether to overwrite, rename (auto-suffix),
+    # or cancel. Silently writing a ``…-N.png`` would surprise users who
+    # expected the name they typed; silently overwriting would destroy
+    # an earlier capture.
+    if target.exists():
+        choice = _ask_overwrite(target)
+        if choice is None:
+            return None
+        if choice == "rename":
+            i = 1
+            while target.exists():
+                target = assets / f"{stem}-{i}.png"
+                i += 1
     crop.save(target, format="PNG")
     return target
