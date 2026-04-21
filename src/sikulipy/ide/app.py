@@ -255,16 +255,54 @@ def _build_explorer(state: _IDEState, refresh: callable) -> ft.Container:
     )
 
 
-def _build_editor(state: _IDEState, refresh: callable) -> ft.Container:
+def _line_col(text: str, offset: int) -> tuple[int, int]:
+    """1-based (line, column) for a caret ``offset`` into ``text``."""
+    if offset <= 0:
+        return 1, 1
+    offset = min(offset, len(text))
+    prefix = text[:offset]
+    line = prefix.count("\n") + 1
+    last_nl = prefix.rfind("\n")
+    column = offset - (last_nl + 1) + 1
+    return line, column
+
+
+def _build_editor(
+    state: _IDEState,
+    refresh: callable,
+    refresh_statusbar: callable,
+) -> ft.Container:
+    # Track the dirty state we last rendered so we only do a *full* layout
+    # rebuild when something structural changed. Rebuilding on every
+    # keystroke rips the TextField out of the tree, which drops focus
+    # after each character.
+    last_dirty = [state.document.dirty]
+
+    def _update_caret(control: ft.TextField) -> None:
+        sel = control.selection
+        offset = sel.extent_offset if sel is not None else len(control.value or "")
+        line, col = _line_col(control.value or "", offset)
+        state.status.set_cursor(line, col)
+
     def _on_change(e: ft.ControlEvent) -> None:
         state.document.set_text(e.control.value)
         state.status.set_file(state.document.path, dirty=state.document.dirty)
-        refresh()
+        _update_caret(e.control)
+        if state.document.dirty != last_dirty[0]:
+            last_dirty[0] = state.document.dirty
+            refresh()
+        else:
+            refresh_statusbar()
+
+    def _on_selection_change(e: ft.ControlEvent) -> None:
+        _update_caret(e.control)
+        refresh_statusbar()
 
     return ft.Container(
         content=ft.TextField(
             value=state.document.text,
             on_change=_on_change,
+            on_selection_change=_on_selection_change,
             multiline=True,
             min_lines=20,
             max_lines=40,
@@ -323,12 +361,16 @@ def _build_console(state: _IDEState) -> ft.Container:
     )
 
 
+def _statusbar_row(state: _IDEState) -> ft.Row:
+    return ft.Row(
+        controls=[ft.Text(seg, size=12) for seg in state.status.segments()],
+        spacing=10,
+    )
+
+
 def _build_statusbar(state: _IDEState) -> ft.Container:
     return ft.Container(
-        content=ft.Row(
-            controls=[ft.Text(seg, size=12) for seg in state.status.segments()],
-            spacing=10,
-        ),
+        content=_statusbar_row(state),
         padding=ft.padding.symmetric(horizontal=10, vertical=4),
         bgcolor=ft.Colors.BLUE_GREY_100,
     )
@@ -348,8 +390,15 @@ def ide_main(page: ft.Page) -> None:
     state = _IDEState(root=Path.cwd())
 
     # The whole layout is rebuilt on refresh — fine for this skeleton;
-    # later phases can switch to fine-grained updates.
+    # later phases can switch to fine-grained updates. The status bar is
+    # already fine-grained (see ``refresh_statusbar``) so the editor can
+    # update caret position without dropping focus.
     container = ft.Column(expand=True, spacing=0)
+    statusbar = _build_statusbar(state)
+
+    def refresh_statusbar() -> None:
+        statusbar.content = _statusbar_row(state)
+        statusbar.update()
 
     def refresh() -> None:
         container.controls = [
@@ -357,7 +406,7 @@ def ide_main(page: ft.Page) -> None:
             ft.Row(
                 controls=[
                     _build_explorer(state, refresh),
-                    _build_editor(state, refresh),
+                    _build_editor(state, refresh, refresh_statusbar),
                     _build_sidebar(state),
                 ],
                 expand=True,
@@ -365,8 +414,9 @@ def ide_main(page: ft.Page) -> None:
                 vertical_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
             _build_console(state),
-            _build_statusbar(state),
+            statusbar,
         ]
+        statusbar.content = _statusbar_row(state)
         page.update()
 
     # Pipe console writes back into the UI.
