@@ -212,6 +212,73 @@ def test_capture_session_save_requires_committed_selection(tmp_path: Path):
         s.save(tmp_path / "x.png")
 
 
+def test_capture_overlay_safe_stem_rejects_path_and_extension():
+    from sikulipy.ide.capture_overlay import _safe_stem
+
+    assert _safe_stem("foo") == "foo"
+    assert _safe_stem("foo.png") == "foo"
+    assert _safe_stem("foo.PNG") == "foo"
+    assert _safe_stem("/a/b/c.png") == "c"
+    assert _safe_stem("../etc/passwd") == "passwd"
+    assert _safe_stem("") == "capture"
+    assert _safe_stem(".png") == "capture"
+
+
+def test_capture_overlay_pick_region_and_save_writes_png(
+    tmp_path: Path, monkeypatch
+):
+    """Exercise the full flow with a stubbed screenshot, overlay, and prompt."""
+    from PIL import Image
+
+    from sikulipy.ide import capture_overlay
+    from sikulipy.ide.capture import CaptureRect
+
+    # Fake 200x100 RGB "screenshot" filled with a single colour so we can
+    # assert the crop later.
+    fake_bg = Image.new("RGB", (200, 100), color=(10, 20, 30))
+    fake_mon = {"left": 0, "top": 0, "width": 200, "height": 100}
+
+    monkeypatch.setattr(
+        capture_overlay, "_grab_fullscreen", lambda: (fake_bg, fake_mon)
+    )
+    monkeypatch.setattr(
+        capture_overlay,
+        "_run_overlay",
+        lambda img: CaptureRect(x=10, y=20, w=30, h=40),
+    )
+    monkeypatch.setattr(
+        capture_overlay, "_ask_filename", lambda default="capture": "button"
+    )
+
+    out = capture_overlay.pick_region_and_save(tmp_path)
+    assert out is not None
+    assert out == (tmp_path / "assets" / "button.png").resolve()
+    assert out.exists()
+
+    # Filename collision should produce -1, -2, ...
+    out2 = capture_overlay.pick_region_and_save(tmp_path)
+    assert out2 is not None
+    assert out2.name == "button-1.png"
+
+    # User cancels the overlay → no file, None returned.
+    monkeypatch.setattr(capture_overlay, "_run_overlay", lambda img: None)
+    assert capture_overlay.pick_region_and_save(tmp_path) is None
+
+    # Region picked, but user cancels the filename prompt → no file.
+    monkeypatch.setattr(
+        capture_overlay,
+        "_run_overlay",
+        lambda img: CaptureRect(x=0, y=0, w=5, h=5),
+    )
+    monkeypatch.setattr(
+        capture_overlay, "_ask_filename", lambda default="capture": None
+    )
+    before = sorted((tmp_path / "assets").iterdir())
+    assert capture_overlay.pick_region_and_save(tmp_path) is None
+    after = sorted((tmp_path / "assets").iterdir())
+    assert before == after
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------

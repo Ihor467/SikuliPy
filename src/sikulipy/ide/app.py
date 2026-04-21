@@ -22,6 +22,7 @@ from pathlib import Path
 import flet as ft
 
 from sikulipy import __version__
+from sikulipy.ide.capture_overlay import pick_region_and_save
 from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry
 from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import ScriptTreeNode, build_tree
@@ -86,11 +87,43 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         state.status.set_message(f"Project: {new_root}")
         refresh()
 
+    def _capture_click(_e):
+        # Reset the headless session (also flips any "captured" state
+        # from a previous run back to "idle") before we take the shot.
+        state.toolbar.begin_capture()
+
+        # Hide the IDE window so the overlay isn't fighting it for
+        # focus and so it doesn't appear in its own screenshot. We
+        # restore it no matter what happens below.
+        prev_minimized = page.window.minimized
+        page.window.minimized = True
+        page.update()
+
+        saved: Path | None = None
+        try:
+            saved = pick_region_and_save(state.root)
+        except Exception as exc:
+            state.status.set_message(f"Capture failed: {exc}")
+        finally:
+            page.window.minimized = prev_minimized
+            page.update()
+
+        if saved is None:
+            state.status.set_message("Capture cancelled")
+        else:
+            state.sidebar.add_captured(saved)
+            try:
+                rel = saved.relative_to(state.root)
+            except ValueError:
+                rel = saved
+            state.status.set_message(f"Captured {rel}")
+        refresh()
+
     return ft.Row(
         controls=[
             ft.ElevatedButton("Run",     icon=ft.Icons.PLAY_ARROW, on_click=_wrap(state.toolbar.run)),
             ft.ElevatedButton("Stop",    icon=ft.Icons.STOP,       on_click=_wrap(state.toolbar.stop)),
-            ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_wrap(state.toolbar.begin_capture)),
+            ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_capture_click),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
             ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
