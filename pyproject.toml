@@ -28,11 +28,11 @@ dependencies = [
     "pydantic>=2.8",       # settings / options model
     "typer>=0.12",         # CLI entry point
     "rich>=13.7",          # console UX
+    "pytesseract>=0.3.13",
 ]
 
 [project.optional-dependencies]
 ocr = [
-    "pytesseract>=0.3.10",
     "paddleocr>=2.7",
 ]
 android = [
