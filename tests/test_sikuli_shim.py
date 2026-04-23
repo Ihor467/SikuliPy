@@ -304,7 +304,7 @@ def test_popup_prefers_kdialog(monkeypatch):
     def fake_which(name: str):
         return f"/usr/bin/{name}" if name == "kdialog" else None
 
-    def fake_run(cmd, capture_output=True, text=True):
+    def fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
         return _StubProc()
 
@@ -321,7 +321,7 @@ def test_popup_falls_back_to_zenity_when_no_kdialog(monkeypatch):
     def fake_which(name: str):
         return f"/usr/bin/{name}" if name == "zenity" else None
 
-    def fake_run(cmd, capture_output=True, text=True):
+    def fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
         return _StubProc()
 
@@ -335,7 +335,7 @@ def test_popup_ask_returns_true_on_zero_exit(monkeypatch):
     monkeypatch.setattr("sikuli._dialogs.shutil.which",
                         lambda name: f"/usr/bin/{name}" if name == "kdialog" else None)
     monkeypatch.setattr("sikuli._dialogs.subprocess.run",
-                        lambda cmd, capture_output=True, text=True: _StubProc(returncode=0))
+                        lambda *a, **k: _StubProc(returncode=0))
     assert sikuli.popupAsk("sure?") is True
     assert sikuli.popask is sikuli.popupAsk
 
@@ -344,7 +344,7 @@ def test_popup_ask_returns_false_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr("sikuli._dialogs.shutil.which",
                         lambda name: f"/usr/bin/{name}" if name == "kdialog" else None)
     monkeypatch.setattr("sikuli._dialogs.subprocess.run",
-                        lambda cmd, capture_output=True, text=True: _StubProc(returncode=1))
+                        lambda *a, **k: _StubProc(returncode=1))
     assert sikuli.popupAsk("sure?") is False
 
 

@@ -179,11 +179,16 @@ def _ask_overwrite(target: Path) -> str | None:
         "  Cancel  → discard the capture"
     )
 
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+
     # kdialog: --warningyesnocancel gives us three buttons. Return codes
     # are 0 = Yes, 1 = No, 2 = Cancel (matches KDE convention).
     if kdialog := shutil.which("kdialog"):
         r = subprocess.run(
             [kdialog, "--title", "File exists", "--warningyesnocancel", prompt],
+            env=env,
         )
         if r.returncode == 0:
             return "overwrite"
@@ -205,7 +210,7 @@ def _ask_overwrite(target: Path) -> str | None:
                 "--cancel-label=Cancel",
                 "--extra-button=Rename",
             ],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         if r.stdout.strip() == "Rename":
             return "rename"

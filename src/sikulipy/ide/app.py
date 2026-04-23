@@ -147,17 +147,20 @@ def _pick_directory(initial: str) -> str | None:
 
     The helpers below all block until the user picks or cancels.
     """
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
     if kdialog := shutil.which("kdialog"):
         r = subprocess.run(
             [kdialog, "--getexistingdirectory", initial],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         return r.stdout.strip() or None if r.returncode == 0 else None
     if zenity := shutil.which("zenity"):
         r = subprocess.run(
             [zenity, "--file-selection", "--directory",
              f"--filename={initial}/", "--title=Open project folder"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         return r.stdout.strip() or None if r.returncode == 0 else None
     # Tkinter fallback (Windows/macOS/Linux without zenity or kdialog).

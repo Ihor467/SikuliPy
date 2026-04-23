@@ -15,8 +15,8 @@ tests.
 | jcraft/jsch             | `paramiko` + `sshtunnel`                     |
 | TigerVNC / VNCClient    | `vncdotool` (Twisted-based, first pass)      |
 | jadb (ADB client)       | `pure-python-adb` or raw socket client       |
-| Tesseract (Tess4J)      | `pytesseract`                                |
-| PaddleOCR (HTTP)        | `paddleocr` in-process + optional HTTP       |
+| Tesseract (Tess4J)      | `pytesseract` (default)                      |
+| PaddleOCR (HTTP)        | `paddleocr` in-process + optional HTTP (via `ocr` extra) |
 | Jython / JRuby runners  | dropped — not relevant in a Python host      |
 | tulskiy/keymaster       | `pynput.keyboard.GlobalHotKeys`              |
 | Native WinUtil.dll      | `pywin32` / `ctypes`                         |

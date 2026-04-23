@@ -28,12 +28,12 @@ dependencies = [
     "pydantic>=2.8",       # settings / options model
     "typer>=0.12",         # CLI entry point
     "rich>=13.7",          # console UX
-    "pytesseract>=0.3.13",
+    "pytesseract>=0.3.13", # default OCR backend
 ]
 
 [project.optional-dependencies]
 ocr = [
-    "paddleocr>=2.7",
+    "paddleocr>=2.7",      # alternative OCR backend (requires paddlepaddle)
 ]
 android = [
     "pure-python-adb>=0.3.0.dev0",

@@ -14,6 +14,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 
+from sikulipy.util.subprocess_env import native_dialog_env
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -21,7 +23,10 @@ import subprocess
 
 
 def _run(cmd: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=capture, text=True)
+    env = native_dialog_env()
+    if capture:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=env)
+    return subprocess.run(cmd, env=env)
 
 
 def _tk_root():
@@ -44,10 +49,10 @@ def _tk_root():
 def popup(message: str, title: str = "SikuliPy") -> None:
     """Show an informational OK dialog. Blocks until dismissed."""
     if kdialog := shutil.which("kdialog"):
-        _run([kdialog, "--title", title, "--msgbox", str(message)])
+        _run([kdialog, "--title", title, "--msgbox", str(message)], capture=False)
         return
     if zenity := shutil.which("zenity"):
-        _run([zenity, "--info", f"--title={title}", f"--text={message}"])
+        _run([zenity, "--info", f"--title={title}", f"--text={message}"], capture=False)
         return
 
     from tkinter import messagebox
