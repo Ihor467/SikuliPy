@@ -34,7 +34,14 @@ def _resolve_pattern(target: PatternLike):
     """Return (needle_bgr_array, similarity, Pattern-or-None).
 
     Accepts a Pattern, Image, path string, Path, or raw numpy array.
+    When the caller passes a bare image (no explicit Pattern), the
+    similarity threshold falls back to the global default exposed
+    through :mod:`sikulipy.core._defaults`. The SikuliX-compatible
+    ``Settings.MinSimilarity`` alias writes through to that module, so
+    ``Settings.MinSimilarity = 0.9`` actually changes every subsequent
+    find().
     """
+    from sikulipy.core._defaults import get_min_similarity
     from sikulipy.core.image import Image
     from sikulipy.core.pattern import Pattern
 
@@ -42,17 +49,19 @@ def _resolve_pattern(target: PatternLike):
         img = target.image
         image_obj = img if isinstance(img, Image) else Image(img)
         return image_obj.load(), target.similarity, target
+
+    default = get_min_similarity()
     if isinstance(target, Image):
-        return target.load(), 0.7, None
+        return target.load(), default, None
     # numpy array, str, or Path
     try:
         import numpy as np  # local import
 
         if isinstance(target, np.ndarray):
-            return target, 0.7, None
+            return target, default, None
     except ImportError:  # pragma: no cover
         pass
-    return Image(target).load(), 0.7, None
+    return Image(target).load(), default, None
 
 
 @dataclass

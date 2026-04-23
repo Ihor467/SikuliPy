@@ -145,6 +145,17 @@ def test_settings_type_delay_writes_through_to_key():
         Key._type_delay = before
 
 
+def test_settings_min_similarity_writes_through_to_defaults():
+    from sikulipy.core._defaults import get_min_similarity
+
+    before = get_min_similarity()
+    try:
+        Settings.MinSimilarity = 0.92
+        assert get_min_similarity() == pytest.approx(0.92)
+    finally:
+        Settings.MinSimilarity = before
+
+
 # ---------------------------------------------------------------------------
 # Bundle path / image path
 # ---------------------------------------------------------------------------

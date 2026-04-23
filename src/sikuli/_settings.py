@@ -36,9 +36,16 @@ def _set_type_delay(value: float) -> None:
     Key._type_delay = float(value)
 
 
+def _set_min_similarity(value: float) -> None:
+    from sikulipy.core._defaults import set_min_similarity
+
+    set_min_similarity(float(value))
+
+
 _WRITE_HOOKS: dict[str, Callable[[Any], None]] = {
     "MoveMouseDelay": _set_move_mouse_delay,
     "TypeDelay": _set_type_delay,
+    "MinSimilarity": _set_min_similarity,
 }
 
 
