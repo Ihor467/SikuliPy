@@ -29,6 +29,17 @@ def selectRegion(prompt: str = "Select a region") -> Region | None:  # noqa: N80
     alacritty, kitty, video players); see ``Region._capture_bgr``.
     """
     del prompt  # reserved; not rendered by the overlay yet
+
+    # Users typically call ``popup("please select...")`` right before us.
+    # kdialog / zenity / Tk return the instant the OK button is clicked,
+    # but the compositor still needs a frame or two to unmap the dialog
+    # window and repaint the desktop underneath. Without this pause the
+    # popup is still on screen when we grab, and it bakes itself into
+    # the overlay's background (and therefore into any subsequent
+    # region.text() capture).
+    import time
+    time.sleep(0.25)
+
     bg, mon = _grab_fullscreen()
     rect = _run_overlay(bg)
     if rect is None or rect.is_empty:
