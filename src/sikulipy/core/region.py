@@ -102,13 +102,49 @@ class Region(Element):
 
     # ---- Capture helper ---------------------------------------------
     def _capture_bgr(self):
-        """Grab this region's pixels as a BGR numpy array via Screen/mss."""
+        """Grab this region's pixels as a BGR numpy array.
+
+        If the region was produced by :func:`sikuli.selectRegion` (or any
+        caller that attached a frozen full-screen bitmap via
+        :meth:`_attach_frozen_bitmap`), we crop from that bitmap rather
+        than doing a fresh ``mss`` grab. This avoids a second compositor
+        round-trip — important on KDE/X11 where kwin's "unredirect
+        fullscreen windows" optimisation can cause a subsequent
+        ``XGetImage`` of the root window to return solid black where an
+        accelerated window (konsole, alacritty, kitty, a video player…)
+        is drawn. Spectacle uses kwin's DBus API and doesn't hit this;
+        ``mss`` does hit it, so we prefer the already-captured pixels
+        whenever we have them.
+        """
+        frozen = getattr(self, "_frozen_bitmap", None)
+        if frozen is not None:
+            bg, ox, oy = frozen
+            # Clamp the crop to the frozen bitmap's bounds.
+            x0 = max(0, self.x - ox)
+            y0 = max(0, self.y - oy)
+            x1 = min(bg.shape[1], x0 + self.w)
+            y1 = min(bg.shape[0], y0 + self.h)
+            if x1 > x0 and y1 > y0:
+                return bg[y0:y1, x0:x1].copy()
+            # Degenerate crop — fall through to a live grab.
+
         # Delay imports to keep Region cheap to import.
         from sikulipy.core.screen import Screen
 
         screen = Screen.get_primary()
         shot = screen.capture(self)
         return shot.bitmap
+
+    def _attach_frozen_bitmap(self, bitmap, origin_x: int, origin_y: int) -> None:
+        """Attach a pre-grabbed BGR bitmap that covers this region.
+
+        ``(origin_x, origin_y)`` is the virtual-screen coordinate of the
+        bitmap's ``(0, 0)`` pixel — usually the mss virtual monitor's
+        top-left. Subsequent :meth:`_capture_bgr` calls will crop from
+        this bitmap instead of calling ``mss`` again. See the docstring
+        on :meth:`_capture_bgr` for why this matters on KDE/X11.
+        """
+        self._frozen_bitmap = (bitmap, int(origin_x), int(origin_y))
 
     # ---- Finding (Phase 1) -------------------------------------------
     def find(self, target: PatternLike) -> "Match":

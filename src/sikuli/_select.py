@@ -20,6 +20,13 @@ def selectRegion(prompt: str = "Select a region") -> Region | None:  # noqa: N80
     the overlay (the overlay only shows the frozen screenshot with a
     crosshair). Pass an informational :func:`popup` before calling
     :func:`selectRegion` if you need to brief the user.
+
+    The returned Region remembers the full-screen bitmap grabbed for
+    the overlay, so a subsequent ``region.text()`` or ``region.find()``
+    crops from it instead of asking ``mss`` for a fresh grab. On KDE/X11
+    a second grab often comes back as a black rectangle when the target
+    window is an accelerated one kwin has unredirected (konsole,
+    alacritty, kitty, video players); see ``Region._capture_bgr``.
     """
     del prompt  # reserved; not rendered by the overlay yet
     bg, mon = _grab_fullscreen()
@@ -30,8 +37,27 @@ def selectRegion(prompt: str = "Select a region") -> Region | None:  # noqa: N80
     # mon["left"] / mon["top"] are usually 0 on a single-monitor setup,
     # but on multi-monitor layouts with a non-zero virtual origin we
     # want the absolute screen coord, which is what rect already carries.
-    del mon
-    return Region(x=rect.x, y=rect.y, w=rect.w, h=rect.h)
+    region = Region(x=rect.x, y=rect.y, w=rect.w, h=rect.h)
+
+    # Attach the overlay's frozen screenshot so text() / find() don't
+    # re-grab. bg is a PIL RGB image; convert to BGR ndarray for parity
+    # with the rest of the capture pipeline.
+    try:
+        import numpy as np
+
+        arr = np.array(bg)  # HxWx3 RGB
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            arr = arr[:, :, ::-1]  # RGB -> BGR
+        region._attach_frozen_bitmap(
+            arr, origin_x=int(mon["left"]), origin_y=int(mon["top"])
+        )
+    except Exception:
+        # If numpy/PIL conversion fails for any reason, fall back to
+        # live mss grabs — recognition may still succeed on non-KDE
+        # hosts.
+        pass
+
+    return region
 
 
 __all__ = ["selectRegion"]
