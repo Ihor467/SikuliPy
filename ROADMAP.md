@@ -32,7 +32,7 @@ tests.
 * Flet IDE skeleton (`uv run sikulipy-ide`)
 * Smoke tests
 
-### Phase 1 — Core visual engine ✅ *(implemented, tests gated on CPU ≥ x86-64-v2)*
+### Phase 1 — Core visual engine ✅
 Goal reached: `Screen.get_primary().find(pattern)` returns a real `Match`.
 
 | Java source                                        | Python target                             |
