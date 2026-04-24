@@ -41,7 +41,7 @@ def test_classify_recognises_kinds(tmp_path: Path):
     assert classify(bundle) == "bundle"
     assert classify(script) == "script"
     assert classify(image) == "image"
-    assert classify(unknown) is None
+    assert classify(unknown) == "file"
 
 
 def test_build_tree_lists_scripts_bundles_and_hidden(tmp_path: Path):

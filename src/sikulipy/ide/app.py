@@ -73,19 +73,26 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
 
     def _open_click(_e):
         try:
-            folder = _pick_directory(str(state.root))
+            chosen = _pick_open_file(str(state.root))
         except Exception as exc:
             state.status.set_message(f"Picker failed: {exc!r}")
             refresh()
             return
-        if not folder:
+        if not chosen:
             state.status.set_message("Open cancelled")
             refresh()
             return
-        new_root = Path(folder).resolve()
+        chosen_path = Path(chosen).resolve()
+        # Re-root the explorer on the chosen file's parent so the tree
+        # reflects the project you're now editing.
+        new_root = chosen_path.parent if chosen_path.is_file() else chosen_path.parent
         state.root = new_root
         state.expanded_dirs = {new_root}
-        state.status.set_message(f"Project: {new_root}")
+        try:
+            state.toolbar.open(chosen_path)
+            state.status.set_file(state.document.path, dirty=False)
+        except Exception as exc:
+            state.status.set_message(f"Open failed: {exc}")
         refresh()
 
     def _capture_click(_e):
@@ -133,44 +140,77 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
     )
 
 
-def _pick_directory(initial: str) -> str | None:
-    """Show a native folder picker, returning the chosen path or None.
+def _pick_save_file(initial_dir: str, suggested_name: str = "untitled.py") -> str | None:
+    """Show a native Save-As dialog; return chosen path or None if cancelled.
 
-    Flet's built-in ``FilePicker.get_directory_path`` shells out to
-    ``zenity`` on Linux; on KDE or any host without zenity installed,
-    the call hangs indefinitely. We sidestep Flet entirely and probe
-    for a working native helper in this order:
-
-    1. ``kdialog --getexistingdirectory`` (KDE Plasma)
-    2. ``zenity --file-selection --directory`` (GNOME / generic)
-    3. ``tkinter.filedialog.askdirectory`` (cross-platform Python-only)
-
-    The helpers below all block until the user picks or cancels.
+    Probes kdialog, zenity, then tk.filedialog — so the IDE stays usable
+    on KDE hosts where zenity isn't installed.
     """
     from sikulipy.util.subprocess_env import native_dialog_env
 
     env = native_dialog_env()
+    initial = f"{initial_dir.rstrip('/')}/{suggested_name}"
     if kdialog := shutil.which("kdialog"):
         r = subprocess.run(
-            [kdialog, "--getexistingdirectory", initial],
+            [kdialog, "--getsavefilename", initial, "*.py|Python scripts\n*|All files"],
             capture_output=True, text=True, env=env,
         )
         return r.stdout.strip() or None if r.returncode == 0 else None
     if zenity := shutil.which("zenity"):
         r = subprocess.run(
-            [zenity, "--file-selection", "--directory",
-             f"--filename={initial}/", "--title=Open project folder"],
+            [zenity, "--file-selection", "--save", "--confirm-overwrite",
+             f"--filename={initial}", "--file-filter=Python scripts | *.py",
+             "--title=Save script as"],
             capture_output=True, text=True, env=env,
         )
         return r.stdout.strip() or None if r.returncode == 0 else None
-    # Tkinter fallback (Windows/macOS/Linux without zenity or kdialog).
     import tkinter
     from tkinter import filedialog
     root = tkinter.Tk()
     root.withdraw()
     try:
-        path = filedialog.askdirectory(
-            title="Open project folder", initialdir=initial
+        path = filedialog.asksaveasfilename(
+            title="Save script as",
+            initialdir=initial_dir,
+            initialfile=suggested_name,
+            defaultextension=".py",
+            filetypes=[("Python scripts", "*.py"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return path or None
+
+
+def _pick_open_file(initial_dir: str) -> str | None:
+    """Show a native Open-file dialog filtered to .py / .sikuli."""
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--getopenfilename", initial_dir,
+             "*.py *.sikuli|Python scripts & Sikuli bundles\n*|All files"],
+            capture_output=True, text=True, env=env,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [zenity, "--file-selection",
+             f"--filename={initial_dir}/",
+             "--file-filter=Python scripts | *.py *.sikuli",
+             "--title=Open script"],
+            capture_output=True, text=True, env=env,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    import tkinter
+    from tkinter import filedialog
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        path = filedialog.askopenfilename(
+            title="Open script",
+            initialdir=initial_dir,
+            filetypes=[("Python scripts", "*.py"), ("Sikuli bundles", "*.sikuli"), ("All files", "*.*")],
         )
     finally:
         root.destroy()
@@ -180,8 +220,11 @@ def _pick_directory(initial: str) -> str | None:
 def _save_handler(state: _IDEState):
     def _save():
         if state.document.path is None:
-            target = state.root / "untitled.py"
-            state.document.save(target)
+            chosen = _pick_save_file(str(state.root))
+            if not chosen:
+                state.status.set_message("Save cancelled")
+                return
+            state.document.save(chosen)
         else:
             state.document.save()
         state.status.set_file(state.document.path, dirty=state.document.dirty)
@@ -199,6 +242,7 @@ def _node_to_control(
         "bundle": ft.Icons.INVENTORY_2,
         "script": ft.Icons.DESCRIPTION,
         "image": ft.Icons.IMAGE,
+        "file": ft.Icons.INSERT_DRIVE_FILE,
     }.get(node.kind, ft.Icons.INSERT_DRIVE_FILE)
 
     is_dir = node.kind == "dir"

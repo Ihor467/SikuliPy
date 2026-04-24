@@ -13,6 +13,7 @@ Recognised node kinds:
 * ``"script"``  — a standalone script file (``.py``, ``.rb``, ``.js``,
   ``.robot``, ...)
 * ``"image"``   — a pattern image inside a bundle (``.png``, ``.jpg``, ...)
+* ``"file"``    — any other regular file (shown but not openable as a script)
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-NodeKind = Literal["dir", "bundle", "script", "image"]
+NodeKind = Literal["dir", "bundle", "script", "image", "file"]
 
 
 SCRIPT_EXTENSIONS: frozenset[str] = frozenset({
@@ -77,6 +78,8 @@ def classify(path: Path) -> NodeKind | None:
         return "script"
     if ext in IMAGE_EXTENSIONS:
         return "image"
+    if path.is_file():
+        return "file"
     return None
 
 
