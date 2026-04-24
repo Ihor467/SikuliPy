@@ -45,9 +45,16 @@ class _IDEState:
         self.console = ConsoleBuffer()
         self.status = StatusModel()
         self.sidebar = SidebarModel(self.document)
+        # Installed later by app.main() once the Flet page exists, so the
+        # runner-finished callback can refresh the UI from the worker thread.
+        self.on_runner_finished: "Callable[[int], None] | None" = None
+        runner = DefaultRunnerHost(
+            console=self.console,
+            on_finished=lambda code: self.on_runner_finished and self.on_runner_finished(code),
+        )
         self.toolbar = ToolbarActions(
             document=self.document,
-            runner=DefaultRunnerHost(console=self.console),
+            runner=runner,
             on_status=self.status.set_message,
         )
         # Paths of directories currently expanded in the explorer tree.
@@ -127,10 +134,24 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             state.status.set_message(f"Captured {rel}")
         refresh()
 
+    running = state.toolbar.is_running()
+    run_color = ft.Colors.GREY if running else ft.Colors.GREEN
+    stop_color = ft.Colors.GREEN if running else ft.Colors.GREY
+
     return ft.Row(
         controls=[
-            ft.ElevatedButton("Run",     icon=ft.Icons.PLAY_ARROW, on_click=_wrap(state.toolbar.run)),
-            ft.ElevatedButton("Stop",    icon=ft.Icons.STOP,       on_click=_wrap(state.toolbar.stop)),
+            ft.ElevatedButton(
+                "Run",
+                icon=ft.Icons.PLAY_ARROW,
+                icon_color=run_color,
+                on_click=_wrap(state.toolbar.run),
+            ),
+            ft.ElevatedButton(
+                "Stop",
+                icon=ft.Icons.STOP,
+                icon_color=stop_color,
+                on_click=_wrap(state.toolbar.stop),
+            ),
             ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_capture_click),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
             ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_click),
@@ -499,6 +520,16 @@ def ide_main(page: ft.Page) -> None:
 
     # Pipe console writes back into the UI.
     state.console.subscribe(lambda _entry: refresh())
+
+    def _on_finished(code: int) -> None:
+        name = state.document.path.name if state.document.path else "script"
+        if code == 0:
+            state.status.set_message(f"Finished {name} (exit 0)")
+        else:
+            state.status.set_message(f"Finished {name} with errors (exit {code})")
+        refresh()
+
+    state.on_runner_finished = _on_finished
 
     page.add(container)
     refresh()

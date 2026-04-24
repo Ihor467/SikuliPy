@@ -39,11 +39,20 @@ class DefaultRunnerHost:
     :class:`ConsoleBuffer` via :class:`ConsoleRedirect`, so the IDE's
     console pane shows script output instead of the terminal that
     launched the IDE.
+
+    ``on_finished`` (optional) is invoked from the runner thread once the
+    script returns, with the integer exit code. Useful for the Flet view
+    to refresh toolbar state and the status line when a script ends.
     """
 
     console: ConsoleBuffer | None = None
+    on_finished: Callable[[int], None] | None = None
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _exit_code: int | None = field(default=None, init=False, repr=False)
+
+    @property
+    def exit_code(self) -> int | None:
+        return self._exit_code
 
     def run(self, path: Path) -> int:
         from sikulipy.runners import run_file
@@ -66,11 +75,18 @@ class DefaultRunnerHost:
                 traceback.print_exc()
 
         def _target() -> None:
-            if self.console is not None:
-                with ConsoleRedirect(self.console, tee=True):
+            try:
+                if self.console is not None:
+                    with ConsoleRedirect(self.console, tee=True):
+                        _body()
+                else:
                     _body()
-            else:
-                _body()
+            finally:
+                if self.on_finished is not None:
+                    try:
+                        self.on_finished(self._exit_code if self._exit_code is not None else 0)
+                    except Exception:
+                        traceback.print_exc()
 
         self._thread = threading.Thread(target=_target, daemon=True)
         self._thread.start()
