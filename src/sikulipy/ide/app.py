@@ -61,6 +61,8 @@ class _IDEState:
         # Root is expanded by default so the top-level is immediately
         # visible.
         self.expanded_dirs: set[Path] = {root.resolve()}
+        # Currently-previewed pattern in the sidebar (None == no selection).
+        self.selected_pattern: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +80,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
         return handler
 
-    def _open_click(_e):
+    def _open_file_click(_e):
         try:
             chosen = _pick_open_file(str(state.root))
         except Exception as exc:
@@ -90,9 +92,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
             return
         chosen_path = Path(chosen).resolve()
-        # Re-root the explorer on the chosen file's parent so the tree
-        # reflects the project you're now editing.
-        new_root = chosen_path.parent if chosen_path.is_file() else chosen_path.parent
+        new_root = chosen_path.parent
         state.root = new_root
         state.expanded_dirs = {new_root}
         try:
@@ -100,6 +100,23 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             state.status.set_file(state.document.path, dirty=False)
         except Exception as exc:
             state.status.set_message(f"Open failed: {exc}")
+        refresh()
+
+    def _open_folder_click(_e):
+        try:
+            folder = _pick_directory(str(state.root))
+        except Exception as exc:
+            state.status.set_message(f"Picker failed: {exc!r}")
+            refresh()
+            return
+        if not folder:
+            state.status.set_message("Open cancelled")
+            refresh()
+            return
+        new_root = Path(folder).resolve()
+        state.root = new_root
+        state.expanded_dirs = {new_root}
+        state.status.set_message(f"Project: {new_root}")
         refresh()
 
     def _capture_click(_e):
@@ -154,7 +171,26 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             ),
             ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_capture_click),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
-            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_click),
+            ft.PopupMenuButton(
+                content=ft.Container(
+                    content=ft.Row(
+                        controls=[
+                            ft.Icon(ft.Icons.FOLDER_OPEN, size=18),
+                            ft.Text("Open"),
+                            ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=18),
+                        ],
+                        spacing=4,
+                        tight=True,
+                    ),
+                    padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    border_radius=4,
+                ),
+                items=[
+                    ft.PopupMenuItem(content="Open File...", icon=ft.Icons.FILE_OPEN, on_click=_open_file_click),
+                    ft.PopupMenuItem(content="Open Folder...", icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
+                ],
+            ),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
         ],
         spacing=8,
@@ -196,6 +232,37 @@ def _pick_save_file(initial_dir: str, suggested_name: str = "untitled.py") -> st
             initialfile=suggested_name,
             defaultextension=".py",
             filetypes=[("Python scripts", "*.py"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+    return path or None
+
+
+def _pick_directory(initial: str) -> str | None:
+    """Show a native folder picker; return chosen path or None."""
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--getexistingdirectory", initial],
+            capture_output=True, text=True, env=env,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [zenity, "--file-selection", "--directory",
+             f"--filename={initial}/", "--title=Open project folder"],
+            capture_output=True, text=True, env=env,
+        )
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    import tkinter
+    from tkinter import filedialog
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        path = filedialog.askdirectory(
+            title="Open project folder", initialdir=initial
         )
     finally:
         root.destroy()
@@ -413,8 +480,14 @@ def _build_editor(
     )
 
 
-def _build_sidebar(state: _IDEState) -> ft.Container:
+def _build_sidebar(state: _IDEState, refresh: callable) -> ft.Container:
     items = state.sidebar.items()
+    # Drop a stale selection if the previously-picked pattern is no longer
+    # in the project (e.g. user opened a different folder).
+    item_paths = {it.path for it in items}
+    if state.selected_pattern is not None and state.selected_pattern not in item_paths:
+        state.selected_pattern = None
+
     if not items:
         body: ft.Control = ft.Text(
             "(no patterns)", italic=True, color=ft.Colors.GREY
@@ -423,19 +496,80 @@ def _build_sidebar(state: _IDEState) -> ft.Container:
         rows = []
         for it in items:
             colour = ft.Colors.BLACK if it.exists else ft.Colors.RED
+            is_selected = state.selected_pattern == it.path
+            row = ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.IMAGE, size=16, color=colour),
+                    ft.Text(it.name, size=13, color=colour),
+                ],
+                spacing=6,
+            )
+
+            def _on_select(_e, path=it.path, exists=it.exists):
+                state.selected_pattern = path if exists else None
+                refresh()
+
             rows.append(
-                ft.Row(
-                    controls=[
-                        ft.Icon(ft.Icons.IMAGE, size=16, color=colour),
-                        ft.Text(it.name, size=13, color=colour),
-                    ],
-                    spacing=6,
+                ft.Container(
+                    content=ft.GestureDetector(
+                        content=row,
+                        on_tap=_on_select,
+                        mouse_cursor=ft.MouseCursor.CLICK,
+                    ),
+                    bgcolor=ft.Colors.BLUE_100 if is_selected else None,
+                    padding=ft.padding.symmetric(horizontal=4, vertical=2),
+                    border_radius=3,
                 )
             )
-        body = ft.Column(controls=rows, scroll=ft.ScrollMode.AUTO)
+        body = ft.Column(controls=rows, scroll=ft.ScrollMode.AUTO, spacing=2)
+
+    # Thumbnail underneath: read the bytes and pass them as src_base64
+    # because Flet's desktop runtime cannot resolve arbitrary filesystem
+    # paths through Image.src. Always reserve the slot — even an empty
+    # placeholder — so the column layout doesn't shift on selection.
+    if state.selected_pattern is not None and state.selected_pattern.exists():
+        try:
+            data = state.selected_pattern.read_bytes()
+            preview_image: ft.Control = ft.Image(
+                src=data,
+                fit=ft.BoxFit.CONTAIN,
+            )
+            preview_label = state.selected_pattern.name
+        except Exception as exc:  # pragma: no cover - defensive
+            preview_image = ft.Text(f"(preview failed: {exc})",
+                                    size=11, color=ft.Colors.RED)
+            preview_label = state.selected_pattern.name
+    else:
+        preview_image = ft.Text(
+            "(select a pattern to preview)",
+            italic=True, color=ft.Colors.GREY, size=11,
+        )
+        preview_label = ""
+
+    preview_pane = ft.Column(
+        controls=[
+            ft.Divider(height=1, color=ft.Colors.GREY_400),
+            ft.Text(preview_label or " ", size=12, italic=True),
+            ft.Container(
+                content=preview_image,
+                bgcolor=ft.Colors.WHITE,
+                border=ft.border.all(1, ft.Colors.GREY_400),
+                alignment=ft.Alignment.CENTER,
+                expand=True,
+            ),
+        ],
+        spacing=4,
+    )
+
     return ft.Container(
         content=ft.Column(
-            controls=[ft.Text("Patterns", weight=ft.FontWeight.BOLD), body]
+            controls=[
+                ft.Text("Patterns", weight=ft.FontWeight.BOLD),
+                ft.Container(content=body, expand=True),
+                preview_pane,
+            ],
+            spacing=6,
+            expand=True,
         ),
         padding=10,
         bgcolor=ft.Colors.GREY_100,
@@ -500,19 +634,37 @@ def ide_main(page: ft.Page) -> None:
         statusbar.update()
 
     def refresh() -> None:
+        # Left side stacks toolbar, the explorer+editor row, and the
+        # console. The Patterns pane is a sibling on the right so it
+        # spans the full window height (toolbar + editor + console).
+        left_column = ft.Column(
+            controls=[
+                ft.Container(_build_toolbar(state, page, refresh), padding=10, bgcolor=ft.Colors.GREY_200),
+                ft.Row(
+                    controls=[
+                        _build_explorer(state, refresh),
+                        _build_editor(state, refresh, refresh_statusbar),
+                    ],
+                    expand=True,
+                    spacing=0,
+                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
+                _build_console(state),
+            ],
+            expand=True,
+            spacing=0,
+        )
+
         container.controls = [
-            ft.Container(_build_toolbar(state, page, refresh), padding=10, bgcolor=ft.Colors.GREY_200),
             ft.Row(
                 controls=[
-                    _build_explorer(state, refresh),
-                    _build_editor(state, refresh, refresh_statusbar),
-                    _build_sidebar(state),
+                    ft.Container(content=left_column, expand=True),
+                    _build_sidebar(state, refresh),
                 ],
                 expand=True,
                 spacing=0,
                 vertical_alignment=ft.CrossAxisAlignment.STRETCH,
             ),
-            _build_console(state),
             statusbar,
         ]
         statusbar.content = _statusbar_row(state)
