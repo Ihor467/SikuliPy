@@ -158,6 +158,22 @@ def test_editor_pattern_absolute_paths_resolve_against_document(tmp_path: Path):
     assert doc.pattern_absolute_paths() == [tmp_path / "btn.png"]
 
 
+def test_editor_pattern_at_offset_returns_path_under_caret(tmp_path: Path):
+    target = tmp_path / "script.py"
+    target.write_text("")
+    text = "x = 1\nPattern('btn.png')\nname = 'plain'\n"
+    doc = EditorDocument(text=text, path=target)
+
+    inside = text.index("btn.png") + 2
+    assert doc.pattern_at_offset(inside) == tmp_path / "btn.png"
+
+    outside = text.index("x = 1")
+    assert doc.pattern_at_offset(outside) is None
+
+    plain = text.index("plain") + 1
+    assert doc.pattern_at_offset(plain) is None
+
+
 # ---------------------------------------------------------------------------
 # Console
 # ---------------------------------------------------------------------------

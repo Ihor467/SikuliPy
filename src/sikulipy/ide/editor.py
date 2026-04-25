@@ -167,6 +167,25 @@ class EditorDocument:
             seen.setdefault(m.group("path"), None)
         return list(seen.keys())
 
+    def pattern_at_offset(self, offset: int) -> Path | None:
+        """Return the absolute path of the image literal under ``offset``.
+
+        Looks for any string literal ending in an image extension whose
+        span contains the caret. Returns the resolved absolute path
+        (against the document's folder) or ``None`` if the caret isn't
+        on an image reference.
+        """
+        if not 0 <= offset <= len(self.text):
+            return None
+        base = self.path.parent if self.path is not None else Path.cwd()
+        for m in _IMAGE_LITERAL_RE.finditer(self.text):
+            if m.start() <= offset <= m.end():
+                p = Path(m.group("path"))
+                if not p.is_absolute():
+                    p = base / p
+                return p
+        return None
+
     def pattern_absolute_paths(self) -> list[Path]:
         """Resolve :meth:`pattern_references` against the document's folder.
 

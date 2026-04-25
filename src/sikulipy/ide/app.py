@@ -440,6 +440,7 @@ def _build_editor(
     state: _IDEState,
     refresh: callable,
     refresh_statusbar: callable,
+    refresh_sidebar: callable,
 ) -> ft.Container:
     # Never do a full layout rebuild in response to typing: that would
     # swap the TextField out of the tree and drop focus. The dirty
@@ -454,14 +455,41 @@ def _build_editor(
         line, col = _line_col(control.value or "", offset)
         state.status.set_cursor(line, col)
 
+    def _maybe_select_pattern_under_caret(control: ft.TextField) -> bool:
+        """Update ``state.selected_pattern`` from the caret position.
+
+        Returns True iff the selection changed and the sidebar should be
+        re-rendered.
+        """
+        sel = control.selection
+        if sel is None:
+            return False
+        offset = sel.extent_offset
+        match = state.document.pattern_at_offset(offset)
+        if match is None:
+            return False
+        if match == state.selected_pattern:
+            return False
+        # Only auto-switch to a real file; leave a missing literal alone
+        # so the user's manually-selected thumbnail isn't blanked out by
+        # typo'd path under the caret.
+        if not match.exists():
+            return False
+        state.selected_pattern = match
+        return True
+
     def _on_change(e: ft.ControlEvent) -> None:
         state.document.set_text(e.control.value)
         state.status.set_file(state.document.path, dirty=state.document.dirty)
         _update_caret(e.control)
+        if _maybe_select_pattern_under_caret(e.control):
+            refresh_sidebar()
         refresh_statusbar()
 
     def _on_selection_change(e: ft.ControlEvent) -> None:
         _update_caret(e.control)
+        if _maybe_select_pattern_under_caret(e.control):
+            refresh_sidebar()
         refresh_statusbar()
 
     return ft.Container(
@@ -628,10 +656,18 @@ def ide_main(page: ft.Page) -> None:
     # update caret position without dropping focus.
     container = ft.Column(expand=True, spacing=0)
     statusbar = _build_statusbar(state)
+    # Stable wrapper so we can swap only the sidebar's content when the
+    # caret moves over an image literal — no full layout rebuild, no
+    # focus loss in the editor.
+    sidebar_wrapper = ft.Container()
 
     def refresh_statusbar() -> None:
         statusbar.content = _statusbar_row(state)
         statusbar.update()
+
+    def refresh_sidebar() -> None:
+        sidebar_wrapper.content = _build_sidebar(state, refresh)
+        sidebar_wrapper.update()
 
     def refresh() -> None:
         # Left side stacks toolbar, the explorer+editor row, and the
@@ -643,7 +679,7 @@ def ide_main(page: ft.Page) -> None:
                 ft.Row(
                     controls=[
                         _build_explorer(state, refresh),
-                        _build_editor(state, refresh, refresh_statusbar),
+                        _build_editor(state, refresh, refresh_statusbar, refresh_sidebar),
                     ],
                     expand=True,
                     spacing=0,
@@ -655,11 +691,12 @@ def ide_main(page: ft.Page) -> None:
             spacing=0,
         )
 
+        sidebar_wrapper.content = _build_sidebar(state, refresh)
         container.controls = [
             ft.Row(
                 controls=[
                     ft.Container(content=left_column, expand=True),
-                    _build_sidebar(state, refresh),
+                    sidebar_wrapper,
                 ],
                 expand=True,
                 spacing=0,
