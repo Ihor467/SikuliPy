@@ -80,28 +80,6 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
         return handler
 
-    def _open_file_click(_e):
-        try:
-            chosen = _pick_open_file(str(state.root))
-        except Exception as exc:
-            state.status.set_message(f"Picker failed: {exc!r}")
-            refresh()
-            return
-        if not chosen:
-            state.status.set_message("Open cancelled")
-            refresh()
-            return
-        chosen_path = Path(chosen).resolve()
-        new_root = chosen_path.parent
-        state.root = new_root
-        state.expanded_dirs = {new_root}
-        try:
-            state.toolbar.open(chosen_path)
-            state.status.set_file(state.document.path, dirty=False)
-        except Exception as exc:
-            state.status.set_message(f"Open failed: {exc}")
-        refresh()
-
     def _open_folder_click(_e):
         try:
             folder = _pick_directory(str(state.root))
@@ -171,26 +149,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             ),
             ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_capture_click),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
-            ft.PopupMenuButton(
-                content=ft.Container(
-                    content=ft.Row(
-                        controls=[
-                            ft.Icon(ft.Icons.FOLDER_OPEN, size=18),
-                            ft.Text("Open"),
-                            ft.Icon(ft.Icons.ARROW_DROP_DOWN, size=18),
-                        ],
-                        spacing=4,
-                        tight=True,
-                    ),
-                    padding=ft.padding.symmetric(horizontal=12, vertical=8),
-                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
-                    border_radius=4,
-                ),
-                items=[
-                    ft.PopupMenuItem(content="Open File...", icon=ft.Icons.FILE_OPEN, on_click=_open_file_click),
-                    ft.PopupMenuItem(content="Open Folder...", icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
-                ],
-            ),
+            ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
         ],
         spacing=8,
@@ -263,42 +222,6 @@ def _pick_directory(initial: str) -> str | None:
     try:
         path = filedialog.askdirectory(
             title="Open project folder", initialdir=initial
-        )
-    finally:
-        root.destroy()
-    return path or None
-
-
-def _pick_open_file(initial_dir: str) -> str | None:
-    """Show a native Open-file dialog filtered to .py / .sikuli."""
-    from sikulipy.util.subprocess_env import native_dialog_env
-
-    env = native_dialog_env()
-    if kdialog := shutil.which("kdialog"):
-        r = subprocess.run(
-            [kdialog, "--getopenfilename", initial_dir,
-             "*.py *.sikuli|Python scripts & Sikuli bundles\n*|All files"],
-            capture_output=True, text=True, env=env,
-        )
-        return r.stdout.strip() or None if r.returncode == 0 else None
-    if zenity := shutil.which("zenity"):
-        r = subprocess.run(
-            [zenity, "--file-selection",
-             f"--filename={initial_dir}/",
-             "--file-filter=Python scripts | *.py *.sikuli",
-             "--title=Open script"],
-            capture_output=True, text=True, env=env,
-        )
-        return r.stdout.strip() or None if r.returncode == 0 else None
-    import tkinter
-    from tkinter import filedialog
-    root = tkinter.Tk()
-    root.withdraw()
-    try:
-        path = filedialog.askopenfilename(
-            title="Open script",
-            initialdir=initial_dir,
-            filetypes=[("Python scripts", "*.py"), ("Sikuli bundles", "*.sikuli"), ("All files", "*.*")],
         )
     finally:
         root.destroy()
