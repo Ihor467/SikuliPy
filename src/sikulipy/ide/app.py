@@ -26,6 +26,7 @@ from sikulipy.ide.capture_overlay import pick_region_and_save
 from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry
 from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import ScriptTreeNode, build_tree
+from sikulipy.ide.recorder import RecorderAction, RecorderSession
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
 from sikulipy.ide.toolbar import DefaultRunnerHost, ToolbarActions
@@ -63,6 +64,8 @@ class _IDEState:
         self.expanded_dirs: set[Path] = {root.resolve()}
         # Currently-previewed pattern in the sidebar (None == no selection).
         self.selected_pattern: Path | None = None
+        # Active recorder session, or None when not recording.
+        self.recorder: RecorderSession | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +132,21 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             state.status.set_message(f"Captured {rel}")
         refresh()
 
+    def _record_click(_e):
+        if state.recorder is None:
+            state.recorder = RecorderSession()
+            state.status.set_message("Recording — use buttons under the editor")
+        else:
+            state.recorder.discard()
+            state.recorder = None
+            state.status.set_message("Recording cancelled")
+        refresh()
+
     running = state.toolbar.is_running()
     run_color = ft.Colors.GREY if running else ft.Colors.GREEN
     stop_color = ft.Colors.GREEN if running else ft.Colors.GREY
+    recording = state.recorder is not None
+    record_color = ft.Colors.RED if recording else ft.Colors.GREY
 
     return ft.Row(
         controls=[
@@ -148,6 +163,12 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
                 on_click=_wrap(state.toolbar.stop),
             ),
             ft.ElevatedButton("Capture", icon=ft.Icons.CROP,       on_click=_capture_click),
+            ft.ElevatedButton(
+                "Record",
+                icon=ft.Icons.FIBER_MANUAL_RECORD,
+                icon_color=record_color,
+                on_click=_record_click,
+            ),
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
             ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
@@ -421,8 +442,6 @@ def _build_editor(
             on_change=_on_change,
             on_selection_change=_on_selection_change,
             multiline=True,
-            min_lines=20,
-            max_lines=40,
             text_style=ft.TextStyle(font_family="monospace", size=14),
             expand=True,
         ),
@@ -529,6 +548,200 @@ def _build_sidebar(state: _IDEState, refresh: callable) -> ft.Container:
     )
 
 
+_PATTERN_ACTIONS: list[tuple[str, RecorderAction]] = [
+    ("Click", RecorderAction.CLICK),
+    ("DblClick", RecorderAction.DBLCLICK),
+    ("RClick", RecorderAction.RCLICK),
+    ("Wait", RecorderAction.WAIT),
+    ("WaitVanish", RecorderAction.WAIT_VANISH),
+]
+_PAYLOAD_ACTIONS: list[tuple[str, RecorderAction, str]] = [
+    # (label, action, prompt)
+    ("Type", RecorderAction.TYPE, "Text to type:"),
+    ("Keys", RecorderAction.KEY_COMBO, "Key combo (e.g. Ctrl+Shift+c):"),
+    ("Pause", RecorderAction.PAUSE, "Pause seconds:"),
+]
+
+
+def _prompt_payload(page: ft.Page, prompt: str, on_ok) -> None:
+    """Open a small Flet AlertDialog with a single TextField. Calls
+    ``on_ok(value)`` when the user confirms; closes the dialog either way.
+    """
+    field = ft.TextField(label=prompt, autofocus=True)
+
+    def _close() -> None:
+        page.close(dlg)
+
+    def _confirm(_e=None) -> None:
+        value = field.value or ""
+        _close()
+        on_ok(value)
+
+    field.on_submit = _confirm
+    dlg = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Recorder"),
+        content=field,
+        actions=[
+            ft.TextButton("Cancel", on_click=lambda _e: _close()),
+            ft.TextButton("OK", on_click=_confirm),
+        ],
+    )
+    page.open(dlg)
+
+
+def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Container | None:
+    if state.recorder is None:
+        return None
+    session = state.recorder
+
+    def _record_pattern(action: RecorderAction):
+        def handler(_e):
+            try:
+                session.workflow.begin(action)
+            except RuntimeError as exc:
+                state.status.set_message(f"Recorder busy: {exc}")
+                refresh()
+                return
+
+            prev_minimized = page.window.minimized
+            page.window.minimized = True
+            page.update()
+
+            saved: Path | None = None
+            try:
+                saved = pick_region_and_save(session.temp_dir())
+            except Exception as exc:
+                state.status.set_message(f"Capture failed: {exc}")
+            finally:
+                page.window.minimized = prev_minimized
+                page.update()
+                session.workflow.finish()
+
+            if saved is None:
+                state.status.set_message("Capture cancelled")
+            else:
+                session.record_pattern(action, saved)
+                state.status.set_message(f"Recorded {action.value}: {saved.name}")
+            refresh()
+
+        return handler
+
+    def _record_payload(action: RecorderAction, prompt: str):
+        def handler(_e):
+            def _on_ok(value: str) -> None:
+                value = value.strip()
+                if not value:
+                    state.status.set_message("Recording step skipped (empty input)")
+                    refresh()
+                    return
+                try:
+                    session.record_payload(action, value)
+                    state.status.set_message(f"Recorded {action.value}")
+                except (ValueError, Exception) as exc:
+                    state.status.set_message(f"Record failed: {exc}")
+                refresh()
+
+            _prompt_payload(page, prompt, _on_ok)
+
+        return handler
+
+    def _undo_last(_e):
+        if session.remove_last() is None:
+            state.status.set_message("Nothing to undo")
+        else:
+            state.status.set_message("Removed last recorded step")
+        refresh()
+
+    def _insert_and_stop(_e):
+        if not session.lines():
+            state.status.set_message("Nothing recorded")
+            session.discard()
+            state.recorder = None
+            refresh()
+            return
+        if state.document.path is not None:
+            target_dir = state.document.path.parent
+        else:
+            target_dir = state.root
+        try:
+            code, moved = session.finalize(target_dir)
+        except Exception as exc:
+            state.status.set_message(f"Insert failed: {exc}")
+            refresh()
+            return
+        n_lines = len([ln for ln in code.splitlines() if ln])
+        state.document.insert(code, at=state.document.cursor)
+        state.status.set_file(state.document.path, dirty=state.document.dirty)
+        state.recorder = None
+        state.status.set_message(
+            f"Inserted {n_lines} recorded line(s); copied {len(moved)} pattern(s) to {target_dir}"
+        )
+        refresh()
+
+    def _cancel(_e):
+        session.discard()
+        state.recorder = None
+        state.status.set_message("Recording cancelled")
+        refresh()
+
+    pattern_buttons = [
+        ft.ElevatedButton(label, on_click=_record_pattern(action))
+        for label, action in _PATTERN_ACTIONS
+    ]
+    payload_buttons = [
+        ft.ElevatedButton(label, on_click=_record_payload(action, prompt))
+        for label, action, prompt in _PAYLOAD_ACTIONS
+    ]
+    counter = ft.Text(
+        f"{len(session.lines())} step(s) recorded",
+        size=12,
+        italic=True,
+        color=ft.Colors.GREY_700,
+    )
+    control_buttons = [
+        ft.ElevatedButton("Undo last", icon=ft.Icons.UNDO, on_click=_undo_last),
+        ft.ElevatedButton(
+            "Insert & Stop",
+            icon=ft.Icons.CHECK,
+            icon_color=ft.Colors.GREEN,
+            on_click=_insert_and_stop,
+        ),
+        ft.ElevatedButton(
+            "Cancel",
+            icon=ft.Icons.CLOSE,
+            icon_color=ft.Colors.RED,
+            on_click=_cancel,
+        ),
+    ]
+
+    return ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.Text("Recorder", weight=ft.FontWeight.BOLD),
+                        ft.Container(expand=True),
+                        counter,
+                    ],
+                ),
+                ft.Row(controls=pattern_buttons, spacing=6, wrap=True),
+                ft.Row(controls=payload_buttons, spacing=6, wrap=True),
+                ft.Row(controls=control_buttons, spacing=6, wrap=True),
+            ],
+            spacing=6,
+            expand=True,
+        ),
+        padding=10,
+        bgcolor=ft.Colors.AMBER_50,
+        border=ft.border.all(1, ft.Colors.AMBER_300),
+        left=0,
+        right=0,
+        top=0,
+        bottom=0,
+    )
+
+
 def _build_console(state: _IDEState) -> ft.Container:
     text = state.console.text() or f"SikuliPy {__version__} — ready."
     return ft.Container(
@@ -593,25 +806,51 @@ def ide_main(page: ft.Page) -> None:
         sidebar_wrapper.update()
 
     def refresh() -> None:
-        # Left side stacks toolbar, the explorer+editor row, and the
-        # console. The Patterns pane is a sibling on the right so it
-        # spans the full window height (toolbar + editor + console).
+        # Layout: toolbar on top, then [Explorer | Editor] in a row that
+        # expands to fill the available height, then a full-width Console
+        # below them. Explorer's bottom therefore aligns with editor's
+        # bottom (both end where the console starts).
+        # The recorder bar — when active — is a Stack overlay anchored to
+        # the right portion of the console so it spans only the editor's
+        # width while the console behind it still starts at the IDE's
+        # left edge.
+        explorer_pane = _build_explorer(state, refresh)
+        editor_pane = _build_editor(
+            state, refresh, refresh_statusbar, refresh_sidebar
+        )
+        editor_row = ft.Row(
+            controls=[explorer_pane, editor_pane],
+            expand=True,
+            spacing=0,
+            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        )
+
+        console_pane = _build_console(state)
+        recorder_bar = _build_recorder_bar(state, page, refresh)
+        if recorder_bar is None:
+            bottom_pane: ft.Control = console_pane
+        else:
+            # Stack: console fills the full bottom; recorder bar sits on
+            # top, indented from the left by the explorer's width so it
+            # only covers the area beneath the editor.
+            recorder_bar.left = 240
+            recorder_bar.right = 0
+            recorder_bar.top = 0
+            recorder_bar.bottom = 0
+            bottom_pane = ft.Stack(
+                controls=[console_pane, recorder_bar],
+                height=160,
+            )
+
         left_column = ft.Column(
             controls=[
                 ft.Container(_build_toolbar(state, page, refresh), padding=10, bgcolor=ft.Colors.GREY_200),
-                ft.Row(
-                    controls=[
-                        _build_explorer(state, refresh),
-                        _build_editor(state, refresh, refresh_statusbar, refresh_sidebar),
-                    ],
-                    expand=True,
-                    spacing=0,
-                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-                ),
-                _build_console(state),
+                editor_row,
+                bottom_pane,
             ],
             expand=True,
             spacing=0,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
         sidebar_wrapper.content = _build_sidebar(state, refresh)
