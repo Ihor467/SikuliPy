@@ -158,6 +158,67 @@ def test_editor_pattern_absolute_paths_resolve_against_document(tmp_path: Path):
     assert doc.pattern_absolute_paths() == [tmp_path / "btn.png"]
 
 
+def test_editor_indent_no_selection_indents_current_line():
+    doc = EditorDocument(text="abc\ndef\n", cursor=2)
+    new_start, new_end = doc.indent_selection(2, 2)
+    assert doc.text == "    abc\ndef\n"
+    assert (new_start, new_end) == (6, 6)
+
+
+def test_editor_indent_multiline_selection_indents_each_line():
+    doc = EditorDocument(text="a\nb\nc\n")
+    # Select "a\nb\n" (the first two lines).
+    new_start, new_end = doc.indent_selection(0, 4)
+    assert doc.text == "    a\n    b\nc\n"
+    assert new_start == 4
+    assert new_end == 12
+
+
+def test_editor_indent_selection_ending_on_newline_skips_next_line():
+    doc = EditorDocument(text="a\nb\nc\n")
+    # Selection ends right at the newline of line 2 — line 3 should
+    # NOT be indented.
+    new_start, new_end = doc.indent_selection(0, 4)
+    lines = doc.text.split("\n")
+    assert lines[0] == "    a"
+    assert lines[1] == "    b"
+    assert lines[2] == "c"
+
+
+def test_editor_dedent_removes_one_level():
+    doc = EditorDocument(text="    abc\n    def\n")
+    new_start, new_end = doc.dedent_selection(0, len(doc.text))
+    assert doc.text == "abc\ndef\n"
+    assert new_start == 0
+
+
+def test_editor_dedent_handles_partial_indent():
+    doc = EditorDocument(text="  abc\n")  # only 2 spaces
+    doc.dedent_selection(0, len(doc.text))
+    assert doc.text == "abc\n"
+
+
+def test_editor_dedent_handles_tab():
+    doc = EditorDocument(text="\tabc\n")
+    doc.dedent_selection(0, len(doc.text))
+    assert doc.text == "abc\n"
+
+
+def test_editor_dedent_noop_when_no_indent():
+    doc = EditorDocument(text="abc\n")
+    before = doc.text
+    new_start, new_end = doc.dedent_selection(0, len(before))
+    assert doc.text == before
+    assert new_start == 0
+
+
+def test_editor_indent_then_dedent_roundtrips():
+    doc = EditorDocument(text="x = 1\ny = 2\n")
+    s, e = doc.indent_selection(0, len(doc.text))
+    doc.dedent_selection(s, e)
+    assert doc.text == "x = 1\ny = 2\n"
+
+
 def test_editor_pattern_at_offset_returns_path_under_caret(tmp_path: Path):
     target = tmp_path / "script.py"
     target.write_text("")
@@ -491,6 +552,62 @@ def test_default_runner_captures_tracebacks(tmp_path: Path):
     # printed the traceback through the redirected stderr and set an
     # error exit code.
     assert runner._exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+
+
+def test_lint_text_empty_returns_no_diagnostics():
+    from sikulipy.ide.lint import lint_text
+
+    assert lint_text("") == []
+    assert lint_text("   \n\n\t") == []
+
+
+def test_lint_text_clean_program_returns_no_diagnostics():
+    from sikulipy.ide.lint import lint_text
+
+    src = "x = 1\nprint(x)\n"
+    assert lint_text(src) == []
+
+
+def test_lint_text_reports_syntax_error_with_line_and_column():
+    from sikulipy.ide.lint import lint_text
+
+    diags = lint_text("def f(:\n    pass\n")
+    assert len(diags) == 1
+    assert diags[0].severity == "error"
+    assert diags[0].line == 1
+    assert "syntax" in diags[0].message.lower() or "invalid" in diags[0].message.lower()
+
+
+def test_lint_text_reports_undefined_name_as_warning():
+    from sikulipy.ide.lint import lint_text
+
+    diags = lint_text("print(does_not_exist)\n")
+    assert any(
+        d.severity == "warning" and "does_not_exist" in d.message for d in diags
+    )
+
+
+def test_lint_text_reports_unused_import():
+    from sikulipy.ide.lint import lint_text
+
+    diags = lint_text("import os\n")
+    assert any(
+        d.severity == "warning" and "os" in d.message for d in diags
+    )
+
+
+def test_lint_text_sorts_by_line_then_column():
+    from sikulipy.ide.lint import lint_text
+
+    src = "import os\nimport sys\n"
+    diags = lint_text(src)
+    lines = [d.line for d in diags]
+    assert lines == sorted(lines)
 
 
 # ---------------------------------------------------------------------------

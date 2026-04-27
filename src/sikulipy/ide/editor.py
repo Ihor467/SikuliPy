@@ -113,6 +113,86 @@ class EditorDocument:
         self.cursor = pos + len(text)
         self.dirty = True
 
+    def indent_selection(
+        self, start: int, end: int, indent: str = "    "
+    ) -> tuple[int, int]:
+        """Prepend ``indent`` to every line touched by ``[start, end)``.
+
+        Returns the adjusted ``(start, end)`` so the caller can restore
+        the selection. When ``start == end`` (no selection) only the
+        single line containing the caret is indented and the caret moves
+        right by ``len(indent)``.
+        """
+        if start > end:
+            start, end = end, start
+        line_start = self.text.rfind("\n", 0, start) + 1
+        line_end = end
+        if line_end > line_start and self.text[line_end - 1 : line_end] == "\n":
+            # Selection ends at a newline boundary — don't indent the
+            # following empty line the user didn't actually select.
+            line_end -= 1
+        block = self.text[line_start:line_end]
+        if not block and start == end:
+            block = ""  # caret on empty line: still inserts indent
+        new_block = indent + block.replace("\n", "\n" + indent)
+        self._snapshot()
+        self.text = self.text[:line_start] + new_block + self.text[line_end:]
+        self.dirty = True
+        added_first = len(indent)
+        added_total = len(new_block) - len(block)
+        new_start = start + added_first
+        new_end = end + added_total
+        self.cursor = new_end
+        return new_start, new_end
+
+    def dedent_selection(
+        self, start: int, end: int, indent: str = "    "
+    ) -> tuple[int, int]:
+        """Remove up to one ``indent`` worth of leading whitespace per line.
+
+        Mirrors :meth:`indent_selection` but pops at most ``len(indent)``
+        leading spaces (or one tab) from each touched line. Lines that
+        don't start with whitespace are left alone. Returns the adjusted
+        ``(start, end)``.
+        """
+        if start > end:
+            start, end = end, start
+        line_start = self.text.rfind("\n", 0, start) + 1
+        line_end = end
+        if line_end > line_start and self.text[line_end - 1 : line_end] == "\n":
+            line_end -= 1
+        block = self.text[line_start:line_end]
+        new_lines: list[str] = []
+        first_strip = 0
+        total_strip = 0
+        width = len(indent)
+        for i, line in enumerate(block.split("\n")):
+            if line.startswith("\t"):
+                stripped = line[1:]
+                removed = 1
+            else:
+                # Strip up to ``width`` leading spaces — fewer if the
+                # line is only partially indented.
+                j = 0
+                while j < width and j < len(line) and line[j] == " ":
+                    j += 1
+                stripped = line[j:]
+                removed = j
+            if i == 0:
+                first_strip = removed
+            total_strip += removed
+            new_lines.append(stripped)
+        new_block = "\n".join(new_lines)
+        if new_block == block:
+            return start, end
+        self._snapshot()
+        self.text = self.text[:line_start] + new_block + self.text[line_end:]
+        self.dirty = True
+        new_start = max(line_start, start - first_strip)
+        new_end = end - total_strip
+        self.cursor = new_end
+        return new_start, new_end
+
     def delete_range(self, start: int, end: int) -> None:
         start = max(0, min(start, len(self.text)))
         end = max(0, min(end, len(self.text)))

@@ -28,6 +28,7 @@ from sikulipy.ide.capture_overlay import pick_region_and_save
 from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry
 from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import ScriptTreeNode, build_tree
+from sikulipy.ide.lint import Diagnostic, lint_text
 from sikulipy.ide.recorder import RecorderAction, RecorderSession
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
@@ -71,11 +72,19 @@ class _IDEState:
         # Last-selected tab in the recorder bar; preserved across the
         # full layout rebuilds triggered by Insert Code / refresh().
         self.recorder_tab_index: int = 0
+        # Editor TextField + focus flag, populated by ``_build_editor``.
+        # The page-level keyboard handler reads them to intercept Tab /
+        # Shift+Tab without stealing keys from other inputs.
+        self.editor_field: "ft.TextField | None" = None
+        self.editor_focused: bool = False
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_DOCS_URL = "https://sikulix-2014.readthedocs.io/en/latest/"
 
 
 _HIDE_SETTLE_SECONDS = 0.35
@@ -317,6 +326,29 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             state.status.set_message("Recording cancelled")
         refresh()
 
+    def _docs_click(_e):
+        # Flet desktop's ``page.launch_url`` silently no-ops on Linux
+        # because the embedded Flutter view has no url_launcher plugin
+        # registered. Fall back to Python's ``webbrowser`` (which spawns
+        # xdg-open / open / start), and only if that fails do we try
+        # the Flet path as a last resort.
+        import webbrowser
+
+        opened = False
+        try:
+            opened = webbrowser.open(_DOCS_URL, new=2)
+        except Exception as exc:
+            state.status.set_message(f"webbrowser failed: {exc}")
+        if not opened:
+            try:
+                page.launch_url(_DOCS_URL)
+                opened = True
+            except Exception as exc:
+                state.status.set_message(f"Open docs failed: {exc}")
+        if opened:
+            state.status.set_message(f"Opened {_DOCS_URL}")
+        refresh()
+
     running = state.toolbar.is_running()
     run_color = ft.Colors.GREY if running else ft.Colors.GREEN
     stop_color = ft.Colors.GREEN if running else ft.Colors.GREY
@@ -347,6 +379,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
             ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
+            ft.ElevatedButton("Docs",    icon=ft.Icons.MENU_BOOK,   on_click=_docs_click),
         ],
         spacing=8,
     )
@@ -600,6 +633,65 @@ def _line_col(text: str, offset: int) -> tuple[int, int]:
     return line, column
 
 
+_EDITOR_FONT_SIZE = 14
+_EDITOR_LINE_HEIGHT = 1.4  # matches Flet's default; keep gutter rows in lockstep
+
+
+def _gutter_controls(text: str, diagnostics: list[Diagnostic]) -> list[ft.Control]:
+    """Build right-aligned line-number rows, flagging diagnostic lines.
+
+    The gutter is a plain ``Column`` of ``Text`` controls — no scrolling
+    of its own. The TextField below grows to match its content, so the
+    surrounding scroll view scrolls both panes together.
+    """
+    line_count = max(1, text.count("\n") + 1)
+    flagged = {d.line: d.severity for d in diagnostics}
+    rows: list[ft.Control] = []
+    for n in range(1, line_count + 1):
+        sev = flagged.get(n)
+        color = (
+            ft.Colors.RED_400
+            if sev == "error"
+            else ft.Colors.AMBER_700 if sev == "warning"
+            else ft.Colors.GREY_500
+        )
+        weight = ft.FontWeight.BOLD if sev else ft.FontWeight.NORMAL
+        rows.append(
+            ft.Text(
+                str(n),
+                color=color,
+                weight=weight,
+                text_align=ft.TextAlign.RIGHT,
+                style=ft.TextStyle(
+                    font_family="monospace",
+                    size=_EDITOR_FONT_SIZE,
+                    height=_EDITOR_LINE_HEIGHT,
+                ),
+            )
+        )
+    return rows
+
+
+def _push_lint_to_status(state: _IDEState, diagnostics: list[Diagnostic]) -> None:
+    """Summarize ``diagnostics`` into the status model's lint segment.
+
+    The first diagnostic (errors prioritised over warnings, both already
+    line-sorted) is shown next to the counts so the user sees one
+    actionable hint without having to look elsewhere.
+    """
+    errors = sum(1 for d in diagnostics if d.severity == "error")
+    warnings = sum(1 for d in diagnostics if d.severity == "warning")
+    first = ""
+    for d in diagnostics:
+        if d.severity == "error":
+            first = f"{d.line}:{d.column} {d.message}"
+            break
+    if not first and diagnostics:
+        d = diagnostics[0]
+        first = f"{d.line}:{d.column} {d.message}"
+    state.status.set_lint(errors, warnings, first)
+
+
 def _build_editor(
     state: _IDEState,
     refresh: callable,
@@ -612,6 +704,29 @@ def _build_editor(
     # updates fine-grained. The pattern sidebar stays stale until some
     # other action (save, open, run) triggers a full refresh — fine
     # trade-off for keeping focus on every keystroke.
+
+    initial_diagnostics = lint_text(state.document.text)
+    _push_lint_to_status(state, initial_diagnostics)
+
+    gutter = ft.Column(
+        controls=_gutter_controls(state.document.text, initial_diagnostics),
+        spacing=0,
+        tight=True,
+        horizontal_alignment=ft.CrossAxisAlignment.END,
+    )
+
+    def _refresh_lint_views(text: str) -> None:
+        diags = lint_text(text)
+        gutter.controls = _gutter_controls(text, diags)
+        _push_lint_to_status(state, diags)
+        # Fine-grained updates only — never rebuild the editor row, or
+        # the TextField loses focus mid-keystroke. The status bar is
+        # repainted by the caller via refresh_statusbar().
+        try:
+            gutter.update()
+        except (AssertionError, AttributeError):
+            # Not yet attached to a page (e.g. first build during tests).
+            pass
 
     def _update_caret(control: ft.TextField) -> None:
         sel = control.selection
@@ -651,6 +766,7 @@ def _build_editor(
         state.document.set_text(e.control.value)
         state.status.set_file(state.document.path, dirty=state.document.dirty)
         _update_caret(e.control)
+        _refresh_lint_views(e.control.value or "")
         if _maybe_select_pattern_under_caret(e.control):
             refresh_sidebar()
         refresh_statusbar()
@@ -661,16 +777,65 @@ def _build_editor(
             refresh_sidebar()
         refresh_statusbar()
 
-    return ft.Container(
-        content=ft.TextField(
-            value=state.document.text,
-            on_change=_on_change,
-            on_selection_change=_on_selection_change,
-            multiline=True,
-            text_style=ft.TextStyle(font_family="monospace", size=14),
+    def _on_focus(_e: ft.ControlEvent) -> None:
+        state.editor_focused = True
+
+    def _on_blur(_e: ft.ControlEvent) -> None:
+        state.editor_focused = False
+
+    text_field = ft.TextField(
+        value=state.document.text,
+        on_change=_on_change,
+        on_selection_change=_on_selection_change,
+        on_focus=_on_focus,
+        on_blur=_on_blur,
+        multiline=True,
+        text_style=ft.TextStyle(
+            font_family="monospace",
+            size=_EDITOR_FONT_SIZE,
+            height=_EDITOR_LINE_HEIGHT,
+        ),
+        border=ft.InputBorder.NONE,
+        content_padding=ft.padding.symmetric(horizontal=8, vertical=0),
+        expand=True,
+    )
+    state.editor_field = text_field
+
+    # The gutter Column grows with line count; without clipping the
+    # numbers spill below the editor and overlap the console pane. Wrap
+    # it in a scrollable Container so the column can be taller than the
+    # visible area without overflowing it. Scroll sync with the
+    # TextField is a separate (hard) problem — for now the gutter
+    # scrolls independently if the user reaches for it.
+    gutter_pane = ft.Container(
+        content=ft.Column(
+            controls=[gutter],
+            scroll=ft.ScrollMode.HIDDEN,
+            spacing=0,
+            tight=True,
             expand=True,
         ),
-        padding=10,
+        width=42,
+        padding=ft.padding.only(top=0, right=6, left=2),
+        bgcolor=ft.Colors.GREY_100,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+    )
+    editor_row = ft.Row(
+        controls=[
+            gutter_pane,
+            ft.Container(content=text_field, expand=True),
+        ],
+        spacing=0,
+        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+        expand=True,
+    )
+
+    return ft.Container(
+        content=editor_row,
+        # Small vertical breathing room so line 1 isn't flush against
+        # the toolbar and the last visible line isn't flush against
+        # the console divider.
+        padding=ft.padding.symmetric(horizontal=0, vertical=8),
         expand=True,
     )
 
@@ -1102,9 +1267,32 @@ def _build_console(state: _IDEState) -> ft.Container:
 
 
 def _statusbar_row(state: _IDEState) -> ft.Row:
-    return ft.Row(
+    left = ft.Row(
         controls=[ft.Text(seg, size=12) for seg in state.status.segments()],
         spacing=10,
+        tight=True,
+    )
+    # Color the lint segment based on counts so a glance at the right
+    # edge is enough to see the file's health.
+    if state.status.lint_errors:
+        lint_color = ft.Colors.RED_700
+    elif state.status.lint_warnings:
+        lint_color = ft.Colors.AMBER_800
+    else:
+        lint_color = ft.Colors.GREEN_700
+    right = ft.Row(
+        controls=[
+            ft.Text(seg, size=12, color=lint_color)
+            for seg in state.status.right_segments()
+        ],
+        spacing=10,
+        tight=True,
+    )
+    return ft.Row(
+        controls=[left, right],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        expand=True,
     )
 
 
@@ -1128,6 +1316,52 @@ def ide_main(page: ft.Page) -> None:
     page.padding = 0
 
     state = _IDEState(root=Path.cwd())
+
+    def _on_keyboard(e: ft.KeyboardEvent) -> None:
+        # Swallow Tab / Shift+Tab while the editor's TextField holds
+        # focus and translate them into indent / dedent edits. Without
+        # this Flet's default focus-traversal moves keyboard focus to
+        # the next/previous control on every Tab.
+        if e.key != "Tab":
+            return
+        if not state.editor_focused or state.editor_field is None:
+            return
+        if e.ctrl or e.alt or e.meta:
+            return
+        field = state.editor_field
+        sel = field.selection
+        text = field.value or ""
+        if sel is None:
+            offset = len(text)
+            start = end = offset
+        else:
+            start = min(sel.base_offset, sel.extent_offset)
+            end = max(sel.base_offset, sel.extent_offset)
+        # Sync the document with whatever's currently in the widget;
+        # otherwise undo history loses an entry on quick Tab presses.
+        state.document.set_text(text)
+        if e.shift:
+            new_start, new_end = state.document.dedent_selection(start, end)
+        else:
+            new_start, new_end = state.document.indent_selection(start, end)
+        field.value = state.document.text
+        # Restore the (now-shifted) selection so the user can keep
+        # pressing Tab to indent further.
+        field.selection = ft.TextSelection(
+            base_offset=new_start, extent_offset=new_end
+        )
+        state.document.cursor = new_end
+        state.status.set_file(state.document.path, dirty=state.document.dirty)
+        line, col = _line_col(state.document.text, new_end)
+        state.status.set_cursor(line, col)
+        try:
+            field.focus()
+            field.update()
+        except (AssertionError, AttributeError):
+            pass
+        refresh_statusbar()
+
+    page.on_keyboard_event = _on_keyboard
 
     # The whole layout is rebuilt on refresh — fine for this skeleton;
     # later phases can switch to fine-grained updates. The status bar is
