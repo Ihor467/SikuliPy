@@ -32,6 +32,7 @@ class RecordedLine:
     action: RecorderAction
     code: str
     pattern_path: Path | None = None  # absolute path inside the temp dir
+    pattern_path2: Path | None = None  # second pattern (drag_drop / swipe)
 
 
 @dataclass
@@ -79,11 +80,38 @@ class RecorderSession:
     def record_payload(
         self, action: RecorderAction, payload: str
     ) -> RecordedLine:
-        if action.needs_pattern:
+        if action.needs_pattern or action.needs_two_patterns:
             raise ValueError(f"{action.value} requires a pattern, not a payload")
         gi = GenInput(payload=payload)
         code = self.generator.generate(action, gi)
         line = RecordedLine(action=action, code=code)
+        self._lines.append(line)
+        self._notify()
+        return line
+
+    def record_two_patterns(
+        self,
+        action: RecorderAction,
+        src_path: Path,
+        dst_path: Path,
+        timeout: float = 10.0,
+        similarity: float | None = None,
+    ) -> RecordedLine:
+        if not action.needs_two_patterns:
+            raise ValueError(f"{action.value} does not take two patterns")
+        gi = GenInput(
+            pattern=src_path.name,
+            pattern2=dst_path.name,
+            timeout=timeout,
+            similarity=similarity,
+        )
+        code = self.generator.generate(action, gi)
+        line = RecordedLine(
+            action=action,
+            code=code,
+            pattern_path=src_path,
+            pattern_path2=dst_path,
+        )
         self._lines.append(line)
         self._notify()
         return line
@@ -117,12 +145,11 @@ class RecorderSession:
             if line.pattern_path is None:
                 rewritten_lines.append(line.code)
                 continue
-            dest = _unique_destination(target_dir / line.pattern_path.name)
-            shutil.copy2(line.pattern_path, dest)
+            new_code, dest = _place_pattern(line.pattern_path, target_dir, line.code)
             moved.append(dest)
-            new_code = line.code.replace(
-                f'"{line.pattern_path.name}"', f'"{dest.name}"'
-            )
+            if line.pattern_path2 is not None:
+                new_code, dest2 = _place_pattern(line.pattern_path2, target_dir, new_code)
+                moved.append(dest2)
             rewritten_lines.append(new_code)
         joined = "\n".join(rewritten_lines)
         if joined and not joined.endswith("\n"):
@@ -133,6 +160,31 @@ class RecorderSession:
     def _notify(self) -> None:
         if self.on_change is not None:
             self.on_change()
+
+
+def _place_pattern(src: Path, target_dir: Path, code: str) -> tuple[str, Path]:
+    """Ensure ``src`` ends up inside ``target_dir`` and rewrite ``code``.
+
+    If ``src`` is already inside ``target_dir`` (e.g. saved straight to
+    ``./assets`` by the capture overlay), don't copy — just point the
+    code at the relative ``assets/<name>`` path. Otherwise copy to
+    ``target_dir/<name>`` (with collision suffix) and rewrite the
+    referenced pattern name.
+    """
+    src = src.resolve()
+    target_dir = target_dir.resolve()
+    try:
+        rel = src.relative_to(target_dir)
+        # Already inside — keep the file in place; rewrite to a path
+        # that's relative to the target_dir so the script can find it.
+        new_code = code.replace(f'"{src.name}"', f'"{rel.as_posix()}"', 1)
+        return new_code, src
+    except ValueError:
+        pass
+    dest = _unique_destination(target_dir / src.name)
+    shutil.copy2(src, dest)
+    new_code = code.replace(f'"{src.name}"', f'"{dest.name}"', 1)
+    return new_code, dest
 
 
 def _unique_destination(target: Path) -> Path:

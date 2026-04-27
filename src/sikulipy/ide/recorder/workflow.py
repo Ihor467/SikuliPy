@@ -21,9 +21,17 @@ class RecorderAction(str, Enum):
     RCLICK = "rclick"
     WAIT = "wait"
     WAIT_VANISH = "wait_vanish"
+    DRAG_DROP = "drag_drop"
+    SWIPE = "swipe"
+    WHEEL = "wheel"
     TYPE = "type"
     KEY_COMBO = "key_combo"
     PAUSE = "pause"
+    LAUNCH_APP = "launch_app"
+    CLOSE_APP = "close_app"
+    TEXT_CLICK = "text_click"
+    TEXT_WAIT = "text_wait"
+    TEXT_EXISTS = "text_exists"
 
     @property
     def needs_pattern(self) -> bool:
@@ -34,6 +42,10 @@ class RecorderAction(str, Enum):
             RecorderAction.WAIT,
             RecorderAction.WAIT_VANISH,
         }
+
+    @property
+    def needs_two_patterns(self) -> bool:
+        return self in {RecorderAction.DRAG_DROP, RecorderAction.SWIPE}
 
 
 class RecorderState(str, Enum):
@@ -71,7 +83,7 @@ class RecorderWorkflow:
         self.pending = action
         self.state = (
             RecorderState.CAPTURING_REGION
-            if action.needs_pattern
+            if action.needs_pattern or action.needs_two_patterns
             else RecorderState.WAITING_USER_INPUT
         )
         self._notify()

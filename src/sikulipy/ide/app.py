@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import flet as ft
@@ -66,6 +68,188 @@ class _IDEState:
         self.selected_pattern: Path | None = None
         # Active recorder session, or None when not recording.
         self.recorder: RecorderSession | None = None
+        # Last-selected tab in the recorder bar; preserved across the
+        # full layout rebuilds triggered by Insert Code / refresh().
+        self.recorder_tab_index: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+_HIDE_SETTLE_SECONDS = 0.35
+"""Pause after hiding so the WM has actually pulled our window off
+screen before mss grabs the framebuffer or the user starts interacting
+with whatever's underneath. 300 ms is enough on KWin/GNOME; shorter
+values caught the IDE in the screenshot intermittently."""
+
+
+# Maps a "trigger" substring that recorded code might contain to the
+# import line that needs to be present at the top of the file. Add new
+# entries here as more recorder actions reference modules outside the
+# default ``from sikulipy import *`` star-import.
+_IMPORT_TRIGGERS: list[tuple[str, str]] = [
+    ("App.", "from sikulipy.natives import App"),
+]
+
+
+def _ensure_imports_for(state: "_IDEState", code: str) -> None:
+    """Prepend any missing imports the ``code`` snippet relies on.
+
+    Edits ``state.document`` in place. The cursor is bumped forward by
+    the number of inserted characters so the subsequent insertion in
+    ``_auto_insert`` lands at the original caret position rather than
+    mid-import.
+    """
+    text = state.document.text
+    needed: list[str] = []
+    for trigger, import_line in _IMPORT_TRIGGERS:
+        if trigger in code and import_line not in text:
+            needed.append(import_line)
+    if not needed:
+        return
+    block = "\n".join(needed) + "\n"
+    # Insert imports at the very top so they're discoverable. If the
+    # file already starts with a shebang, slot underneath it.
+    insert_at = 0
+    if text.startswith("#!"):
+        nl = text.find("\n")
+        insert_at = nl + 1 if nl != -1 else len(text)
+    elif text and not text.startswith("\n"):
+        # Make sure the existing first line stays intact below.
+        block = block
+    state.document.insert(block, at=insert_at)
+    if state.document.cursor >= insert_at:
+        state.document.cursor += len(block)
+
+
+def _x11_iconify_by_title(title: str) -> list:
+    """Iconify all top-level X11 windows whose WM_NAME contains ``title``.
+
+    Returns the list of window IDs that were iconified, or ``[]`` if
+    Xlib is unavailable or no window matched. Caller passes the same
+    list back to :func:`_x11_map_by_id` to restore them.
+
+    KWin (and other Linux WMs) frequently ignore Flet's programmatic
+    minimize/visible flags for embedded apps, so we go around Flet and
+    talk to X11 directly. ICCCM iconify is preferred over ``unmap_window``
+    because the WM keeps the window in the task bar / overview, so the
+    user can find it again if anything goes wrong.
+    """
+    try:
+        from Xlib import X, Xatom, display
+    except ImportError:
+        return []
+    try:
+        d = display.Display()
+    except Exception:
+        return []
+    try:
+        root = d.screen().root
+        wm_state = d.intern_atom("WM_CHANGE_STATE")
+        ICONIC_STATE = 3  # ICCCM §4.1.4
+        hidden: list = []
+
+        def walk(win):
+            try:
+                name = win.get_wm_name()
+            except Exception:
+                name = None
+            if name and title in str(name):
+                try:
+                    ev = (
+                        X.ClientMessage, 0, win, wm_state,
+                    )
+                    # Use the higher-level send_event helper.
+                    from Xlib.protocol import event as _xevent
+                    cm = _xevent.ClientMessage(
+                        window=win, client_type=wm_state, data=(32, [ICONIC_STATE, 0, 0, 0, 0]),
+                    )
+                    root.send_event(
+                        cm,
+                        event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+                    )
+                    hidden.append(win.id)
+                except Exception:
+                    pass
+            try:
+                for child in win.query_tree().children:
+                    walk(child)
+            except Exception:
+                pass
+
+        walk(root)
+        d.sync()
+        d.close()
+        return hidden
+    except Exception:
+        try:
+            d.close()
+        except Exception:
+            pass
+        return []
+
+
+def _x11_map_by_id(window_ids: list) -> None:
+    """Restore previously-iconified windows by ID. Best-effort."""
+    if not window_ids:
+        return
+    try:
+        from Xlib import X, display
+    except ImportError:
+        return
+    try:
+        d = display.Display()
+    except Exception:
+        return
+    try:
+        for wid in window_ids:
+            try:
+                win = d.create_resource_object("window", wid)
+                win.map()  # NormalState; WM will restore from icon
+            except Exception:
+                continue
+        d.sync()
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+@contextmanager
+def _ide_hidden(page: ft.Page):
+    """Hide the IDE window for the duration of the block.
+
+    Flet's ``window.minimized`` / ``visible`` flags are routinely
+    ignored by KWin (and intermittently by other Linux WMs) for
+    embedded Flutter apps. The reliable path is to ask X11 directly
+    via ICCCM ``WM_CHANGE_STATE`` to iconify every top-level window
+    whose title is ``SikuliPy IDE …``. We also flip the Flet flags as
+    a best-effort for non-X11 backends.
+    """
+    win = page.window
+    prev_minimized = win.minimized
+    prev_visible = getattr(win, "visible", True)
+    win.minimized = True
+    try:
+        win.visible = False
+    except Exception:
+        pass
+    page.update()
+    hidden_ids = _x11_iconify_by_title("SikuliPy")
+    time.sleep(_HIDE_SETTLE_SECONDS)
+    try:
+        yield
+    finally:
+        _x11_map_by_id(hidden_ids)
+        try:
+            win.visible = prev_visible
+        except Exception:
+            pass
+        win.minimized = prev_minimized
+        page.update()
 
 
 # ---------------------------------------------------------------------------
@@ -105,21 +289,12 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         # from a previous run back to "idle") before we take the shot.
         state.toolbar.begin_capture()
 
-        # Hide the IDE window so the overlay isn't fighting it for
-        # focus and so it doesn't appear in its own screenshot. We
-        # restore it no matter what happens below.
-        prev_minimized = page.window.minimized
-        page.window.minimized = True
-        page.update()
-
         saved: Path | None = None
-        try:
-            saved = pick_region_and_save(state.root)
-        except Exception as exc:
-            state.status.set_message(f"Capture failed: {exc}")
-        finally:
-            page.window.minimized = prev_minimized
-            page.update()
+        with _ide_hidden(page):
+            try:
+                saved = pick_region_and_save(state.root)
+            except Exception as exc:
+                state.status.set_message(f"Capture failed: {exc}")
 
         if saved is None:
             state.status.set_message("Capture cancelled")
@@ -175,6 +350,51 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         ],
         spacing=8,
     )
+
+
+def _ask_native_input(prompt: str, title: str = "SikuliPy", default: str = "") -> str | None:
+    """Show a native input dialog (kdialog → zenity → tk). Returns ``None``
+    on cancel or when no native helper is available.
+
+    Used by recorder buttons that need a payload while the IDE is
+    hidden — a Flet AlertDialog would force the IDE back on top of the
+    underlying app the user is recording against.
+    """
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--title", title, "--inputbox", prompt, default],
+            capture_output=True, text=True, env=env,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [zenity, "--entry", f"--title={title}", f"--text={prompt}",
+             f"--entry-text={default}"],
+            capture_output=True, text=True, env=env,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    import tkinter
+    from tkinter import simpledialog
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except tkinter.TclError:
+            pass
+        value = simpledialog.askstring(title, prompt, initialvalue=default, parent=root)
+    finally:
+        root.destroy()
+    if value is None:
+        return None
+    return value.strip() or None
 
 
 def _pick_save_file(initial_dir: str, suggested_name: str = "untitled.py") -> str | None:
@@ -396,6 +616,11 @@ def _build_editor(
     def _update_caret(control: ft.TextField) -> None:
         sel = control.selection
         offset = sel.extent_offset if sel is not None else len(control.value or "")
+        # Persist the caret offset on the document model so anything
+        # outside the editor (recorder auto-insert, programmatic edits)
+        # uses the user's actual cursor position rather than the stale
+        # default of 0.
+        state.document.cursor = max(0, min(offset, len(control.value or "")))
         line, col = _line_col(control.value or "", offset)
         state.status.set_cursor(line, col)
 
@@ -548,46 +773,47 @@ def _build_sidebar(state: _IDEState, refresh: callable) -> ft.Container:
     )
 
 
-_PATTERN_ACTIONS: list[tuple[str, RecorderAction]] = [
+_IMAGE_ACTIONS: list[tuple[str, RecorderAction]] = [
     ("Click", RecorderAction.CLICK),
     ("DblClick", RecorderAction.DBLCLICK),
     ("RClick", RecorderAction.RCLICK),
     ("Wait", RecorderAction.WAIT),
     ("WaitVanish", RecorderAction.WAIT_VANISH),
 ]
-_PAYLOAD_ACTIONS: list[tuple[str, RecorderAction, str]] = [
+_IMAGE_TWO_PATTERN_ACTIONS: list[tuple[str, RecorderAction]] = [
+    ("Drag&Drop", RecorderAction.DRAG_DROP),
+    ("Swipe", RecorderAction.SWIPE),
+]
+_IMAGE_PAYLOAD_ACTIONS: list[tuple[str, RecorderAction, str]] = [
+    ("Wheel", RecorderAction.WHEEL, "Wheel direction (up/down) and steps, e.g. 'down 3':"),
+]
+_APP_ACTIONS: list[tuple[str, RecorderAction, str]] = [
     # (label, action, prompt)
+    ("Launch App", RecorderAction.LAUNCH_APP, "App name or path:"),
+    ("Close App", RecorderAction.CLOSE_APP, "App name to close:"),
+]
+_TEXT_ACTIONS: list[tuple[str, RecorderAction, str]] = [
+    ("Text.Click", RecorderAction.TEXT_CLICK, "Text to click:"),
+    ("Text.Wait", RecorderAction.TEXT_WAIT, "Text to wait for:"),
+    ("Text.Exists", RecorderAction.TEXT_EXISTS, "Text to check:"),
+]
+_KEYBOARD_ACTIONS: list[tuple[str, RecorderAction, str]] = [
     ("Type", RecorderAction.TYPE, "Text to type:"),
-    ("Keys", RecorderAction.KEY_COMBO, "Key combo (e.g. Ctrl+Shift+c):"),
+    ("Key Combo", RecorderAction.KEY_COMBO, "Key combo (e.g. Ctrl+Shift+c):"),
     ("Pause", RecorderAction.PAUSE, "Pause seconds:"),
 ]
 
 
 def _prompt_payload(page: ft.Page, prompt: str, on_ok) -> None:
-    """Open a small Flet AlertDialog with a single TextField. Calls
-    ``on_ok(value)`` when the user confirms; closes the dialog either way.
+    """Ask the user for a string and call ``on_ok(value)``.
+
+    Uses a native dialog (kdialog → zenity → tk) instead of Flet's
+    AlertDialog because the Flet ``page.open(dlg)`` API isn't available
+    in every Flet release we support, and the native helpers are
+    already used elsewhere in the IDE for consistency.
     """
-    field = ft.TextField(label=prompt, autofocus=True)
-
-    def _close() -> None:
-        page.close(dlg)
-
-    def _confirm(_e=None) -> None:
-        value = field.value or ""
-        _close()
-        on_ok(value)
-
-    field.on_submit = _confirm
-    dlg = ft.AlertDialog(
-        modal=True,
-        title=ft.Text("Recorder"),
-        content=field,
-        actions=[
-            ft.TextButton("Cancel", on_click=lambda _e: _close()),
-            ft.TextButton("OK", on_click=_confirm),
-        ],
-    )
-    page.open(dlg)
+    value = _ask_native_input(prompt, title="Recorder")
+    on_ok(value or "")
 
 
 def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Container | None:
@@ -604,26 +830,94 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
                 refresh()
                 return
 
-            prev_minimized = page.window.minimized
-            page.window.minimized = True
-            page.update()
-
             saved: Path | None = None
             try:
-                saved = pick_region_and_save(session.temp_dir())
-            except Exception as exc:
-                state.status.set_message(f"Capture failed: {exc}")
+                with _ide_hidden(page):
+                    try:
+                        saved = pick_region_and_save(state.root)
+                    except Exception as exc:
+                        state.status.set_message(f"Capture failed: {exc}")
             finally:
-                page.window.minimized = prev_minimized
-                page.update()
                 session.workflow.finish()
 
             if saved is None:
                 state.status.set_message("Capture cancelled")
             else:
                 session.record_pattern(action, saved)
-                state.status.set_message(f"Recorded {action.value}: {saved.name}")
+                state.sidebar.add_captured(saved)
+                msg = _auto_insert() or f"Recorded {action.value}: {saved.name}"
+                state.status.set_message(msg)
             refresh()
+
+        return handler
+
+    def _capture_one(label: str) -> Path | None:
+        saved: Path | None = None
+        with _ide_hidden(page):
+            try:
+                saved = pick_region_and_save(state.root)
+            except Exception as exc:
+                state.status.set_message(f"Capture failed ({label}): {exc}")
+        return saved
+
+    def _record_two_patterns(action: RecorderAction):
+        def handler(_e):
+            try:
+                session.workflow.begin(action)
+            except RuntimeError as exc:
+                state.status.set_message(f"Recorder busy: {exc}")
+                refresh()
+                return
+            try:
+                state.status.set_message(f"{action.value}: capture SOURCE region")
+                src = _capture_one("source")
+                if src is None:
+                    state.status.set_message("Capture cancelled (source)")
+                    return
+                state.status.set_message(f"{action.value}: capture DESTINATION region")
+                dst = _capture_one("destination")
+                if dst is None:
+                    state.status.set_message("Capture cancelled (destination)")
+                    return
+                session.record_two_patterns(action, src, dst)
+                state.sidebar.add_captured(src)
+                state.sidebar.add_captured(dst)
+                msg = _auto_insert() or (
+                    f"Recorded {action.value}: {src.name} → {dst.name}"
+                )
+                state.status.set_message(msg)
+            finally:
+                session.workflow.finish()
+                refresh()
+
+        return handler
+
+    def _record_payload_hidden(action: RecorderAction, prompt: str):
+        """Like ``_record_payload`` but hides the IDE while prompting,
+        so the user can see/interact with the underlying window —
+        used by the Image tab's payload-only buttons (e.g. Wheel)."""
+        def handler(_e):
+            try:
+                session.workflow.begin(action)
+            except RuntimeError as exc:
+                state.status.set_message(f"Recorder busy: {exc}")
+                refresh()
+                return
+            try:
+                with _ide_hidden(page):
+                    value = _ask_native_input(prompt, title=action.value)
+                if not value:
+                    state.status.set_message("Recording step skipped (empty input)")
+                    return
+                try:
+                    session.record_payload(action, value)
+                    msg = _auto_insert() or f"Recorded {action.value}"
+                    state.status.set_message(msg)
+                except (ValueError, Exception) as exc:
+                    state.status.set_message(f"Record failed: {exc}")
+            finally:
+                session.workflow.finish()
+                refresh()
 
         return handler
 
@@ -637,7 +931,8 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
                     return
                 try:
                     session.record_payload(action, value)
-                    state.status.set_message(f"Recorded {action.value}")
+                    msg = _auto_insert() or f"Recorded {action.value}"
+                    state.status.set_message(msg)
                 except (ValueError, Exception) as exc:
                     state.status.set_message(f"Record failed: {exc}")
                 refresh()
@@ -646,20 +941,15 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
 
         return handler
 
-    def _undo_last(_e):
-        if session.remove_last() is None:
-            state.status.set_message("Nothing to undo")
-        else:
-            state.status.set_message("Removed last recorded step")
-        refresh()
-
-    def _insert_and_stop(_e):
+    def _auto_insert() -> str | None:
+        """Finalize the pending session lines and inject them at the
+        editor caret. Returns a short status string describing what was
+        inserted, or ``None`` if there was nothing to insert. Called
+        right after every successful record_* so the user sees code
+        appear immediately and the queue stays drained.
+        """
         if not session.lines():
-            state.status.set_message("Nothing recorded")
-            session.discard()
-            state.recorder = None
-            refresh()
-            return
+            return None
         if state.document.path is not None:
             target_dir = state.document.path.parent
         else:
@@ -667,69 +957,122 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         try:
             code, moved = session.finalize(target_dir)
         except Exception as exc:
-            state.status.set_message(f"Insert failed: {exc}")
-            refresh()
-            return
+            return f"Insert failed: {exc}"
         n_lines = len([ln for ln in code.splitlines() if ln])
-        state.document.insert(code, at=state.document.cursor)
+        # Make sure any imports the recorded code needs are present at
+        # the top of the file, before computing the caret position
+        # (since adding the import shifts existing offsets).
+        _ensure_imports_for(state, code)
+        # Insert at the editor's caret. Prepend a newline if the caret
+        # is mid-line, append one if anything follows the insertion.
+        existing = state.document.text
+        pos = max(0, min(state.document.cursor, len(existing)))
+        if pos > 0 and existing[pos - 1] != "\n":
+            code = "\n" + code
+        if pos < len(existing) and not code.endswith("\n"):
+            code = code + "\n"
+        state.document.insert(code, at=pos)
         state.status.set_file(state.document.path, dirty=state.document.dirty)
-        state.recorder = None
-        state.status.set_message(
-            f"Inserted {n_lines} recorded line(s); copied {len(moved)} pattern(s) to {target_dir}"
-        )
-        refresh()
+        # Drain so the next record doesn't re-insert the same lines.
+        while session.remove_last() is not None:
+            pass
+        return f"Inserted {n_lines} line(s); {len(moved)} pattern(s) → {target_dir}"
 
-    def _cancel(_e):
+    def _close(_e):
         session.discard()
         state.recorder = None
-        state.status.set_message("Recording cancelled")
+        state.status.set_message("Recorder closed")
         refresh()
 
-    pattern_buttons = [
-        ft.ElevatedButton(label, on_click=_record_pattern(action))
-        for label, action in _PATTERN_ACTIONS
-    ]
-    payload_buttons = [
-        ft.ElevatedButton(label, on_click=_record_payload(action, prompt))
-        for label, action, prompt in _PAYLOAD_ACTIONS
-    ]
-    counter = ft.Text(
-        f"{len(session.lines())} step(s) recorded",
-        size=12,
-        italic=True,
-        color=ft.Colors.GREY_700,
+    def _payload_row(specs: list[tuple[str, RecorderAction, str]]) -> ft.Row:
+        return ft.Row(
+            controls=[
+                ft.ElevatedButton(label, on_click=_record_payload(action, prompt))
+                for label, action, prompt in specs
+            ],
+            spacing=6,
+            wrap=True,
+        )
+
+    image_tab = ft.Row(
+        controls=[
+            *(
+                ft.ElevatedButton(label, on_click=_record_pattern(action))
+                for label, action in _IMAGE_ACTIONS
+            ),
+            *(
+                ft.ElevatedButton(label, on_click=_record_two_patterns(action))
+                for label, action in _IMAGE_TWO_PATTERN_ACTIONS
+            ),
+            *(
+                ft.ElevatedButton(label, on_click=_record_payload_hidden(action, prompt))
+                for label, action, prompt in _IMAGE_PAYLOAD_ACTIONS
+            ),
+        ],
+        spacing=6,
+        wrap=True,
     )
-    control_buttons = [
-        ft.ElevatedButton("Undo last", icon=ft.Icons.UNDO, on_click=_undo_last),
-        ft.ElevatedButton(
-            "Insert & Stop",
-            icon=ft.Icons.CHECK,
-            icon_color=ft.Colors.GREEN,
-            on_click=_insert_and_stop,
-        ),
-        ft.ElevatedButton(
-            "Cancel",
-            icon=ft.Icons.CLOSE,
-            icon_color=ft.Colors.RED,
-            on_click=_cancel,
-        ),
+    app_tab = _payload_row(_APP_ACTIONS)
+    text_tab = _payload_row(_TEXT_ACTIONS)
+    keyboard_tab = _payload_row(_KEYBOARD_ACTIONS)
+
+    def _pad(content: ft.Control) -> ft.Container:
+        return ft.Container(content=content, padding=ft.padding.symmetric(vertical=8))
+
+    tab_labels = [
+        ft.Tab(label="Application"),
+        ft.Tab(label="Image"),
+        ft.Tab(label="Text"),
+        ft.Tab(label="Keyboard"),
     ]
+    tab_panes = [
+        _pad(app_tab),
+        _pad(image_tab),
+        _pad(text_tab),
+        _pad(keyboard_tab),
+    ]
+    def _on_tab_change(e: ft.ControlEvent) -> None:
+        try:
+            state.recorder_tab_index = int(e.control.selected_index)
+        except (TypeError, ValueError):
+            pass
+
+    initial_tab = max(0, min(state.recorder_tab_index, len(tab_labels) - 1))
+    tabs = ft.Tabs(
+        length=len(tab_labels),
+        selected_index=initial_tab,
+        on_change=_on_tab_change,
+        content=ft.Column(
+            controls=[
+                ft.TabBar(tabs=tab_labels),
+                ft.Container(
+                    content=ft.TabBarView(controls=tab_panes),
+                    expand=True,
+                ),
+            ],
+            spacing=0,
+            expand=True,
+        ),
+        expand=True,
+    )
+
+    footer = ft.Row(
+        controls=[
+            ft.Container(expand=True),
+            ft.ElevatedButton(
+                "Close",
+                icon=ft.Icons.CLOSE,
+                icon_color=ft.Colors.RED,
+                on_click=_close,
+            ),
+        ],
+        spacing=6,
+    )
 
     return ft.Container(
         content=ft.Column(
-            controls=[
-                ft.Row(
-                    controls=[
-                        ft.Text("Recorder", weight=ft.FontWeight.BOLD),
-                        ft.Container(expand=True),
-                        counter,
-                    ],
-                ),
-                ft.Row(controls=pattern_buttons, spacing=6, wrap=True),
-                ft.Row(controls=payload_buttons, spacing=6, wrap=True),
-                ft.Row(controls=control_buttons, spacing=6, wrap=True),
-            ],
-            spacing=6,
+            controls=[tabs, footer],
+            spacing=4,
             expand=True,
         ),
         padding=10,
