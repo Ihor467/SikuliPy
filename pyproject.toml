@@ -81,3 +81,16 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+sikulipy = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "sikulipy[android]",
+]

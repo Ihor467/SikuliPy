@@ -20,8 +20,12 @@ uv pip install -e ".[dev]"
 # 3. Run the tests (scaffold smoke tests only so far)
 uv run pytest
 
-# 4. Launch the Flet IDE skeleton
+# 4. Launch Sikuli IDE from console
 uv run sikulipy-ide
+
+uv run python src/sikulipy/ide/app.py      # direct file path
+
+ is src/sikulipy/cli.py  # the CLI entry
 ```
 
 ## Layout

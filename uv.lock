@@ -1645,6 +1645,11 @@ vnc = [
     { name = "vncdotool" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "sikulipy", extra = ["android"] },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "ewmh", marker = "sys_platform == 'linux' and extra == 'app'", specifier = ">=0.1.6" },
@@ -1675,6 +1680,9 @@ requires-dist = [
     { name = "vncdotool", marker = "extra == 'vnc'", specifier = ">=1.2" },
 ]
 provides-extras = ["ocr", "android", "vnc", "runners", "app", "dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "sikulipy", extras = ["android"], editable = "." }]
 
 [[package]]
 name = "six"
