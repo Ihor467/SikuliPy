@@ -26,3 +26,8 @@ htmlcov/
 *.pem
 *.key
 *.crt
+
+# Artefacts produced by the example scripts (real device captures —
+# don't ship them).
+examples/tablet_screenshot.png
+examples/*.png

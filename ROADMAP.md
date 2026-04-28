@@ -116,6 +116,21 @@ Flet; `ide/app.py` is a thin view that binds Flet widgets to those models.
 * `recorder/__init__.py` — `ActionRecorder` with swappable `InputListener` Protocol (default `_PynputListener`; tests inject a fake); collects click / double-click / right-click / typed-text / wait events (wait auto-inserted when the gap ≥ 0.5 s); optional `screenshotter` + `pattern_dir` crop a PNG around each click; `generate_script()` synthesises runnable `sikulipy` source using `screen.click(Pattern(...))` / `screen.type(...)` / `time.sleep(...)`
 * Tests: 30 tests — 23 in `tests/test_phase7_ide.py` (explorer, editor, console, capture, sidebar, statusbar, toolbar with fake runner, smoke-import of `app.py`), 7 in `tests/test_phase7_recorder.py` (fake listener + injected clock, script generation, pattern capture gating). Full suite: **131 passed, 3 skipped** (skips are all host-CPU constraints, not Phase 7).
 
+#### Phase 7.1 — Editor polish ✅
+Iterative UX improvements layered on top of the Phase 7 IDE without
+breaking the headless-models contract. Added on the `zenity` branch.
+
+* `ide/lint.py` — new headless module: `Diagnostic` dataclass + `lint_text()` running `ast.parse` first (single, well-located `SyntaxError`) then `pyflakes.api.check` for undefined names / unused imports. Returns line/column/severity records sorted by position; gracefully degrades to syntax-only when pyflakes isn't importable.
+* `ide/editor.py` — `EditorDocument.indent_selection()` / `dedent_selection()`: snapshot for undo, mutate the buffer per touched line, return the adjusted `(start, end)` so the caller can restore the selection. Dedent handles 4-space, partial-space, and tab indents; no-op when nothing strippable; selections ending exactly on a newline don't bleed into the next line.
+* `ide/statusbar.py` — `StatusModel.set_lint(errors, warnings, first)` + `lint_label()` + `right_segments()`. Lint counts and the first issue render right-aligned at the status-bar edge in red / amber / green depending on severity.
+* `ide/app.py`:
+  * Editor pane wraps the `TextField` in a `Row` with a left line-number gutter (`Container` with `clip_behavior=HARD_EDGE` + scrollable inner `Column` so the gutter can't overflow into the console pane). Diagnostic lines are flagged in red / amber.
+  * `_refresh_lint_views()` runs on every keystroke, updates the gutter via fine-grained `gutter.update()` (never rebuilds the editor row, so `TextField` focus survives), and pushes counts into `StatusModel`.
+  * Page-level `on_keyboard_event` intercepts Tab / Shift+Tab when the editor's `TextField` has focus (`on_focus`/`on_blur` track focus, the field registers itself on `_IDEState.editor_field`). Handler calls `EditorDocument.indent_selection` / `dedent_selection`, restores the selection via `ft.TextSelection`, refocuses, refreshes the status bar — no more focus escaping to the toolbar.
+  * Toolbar gains a **Docs** button that opens `https://sikulix-2014.readthedocs.io/en/latest/` via `webbrowser.open()` (Flet's `page.launch_url` silently no-ops on Linux desktop; kept as fallback).
+  * Editor container gets 8 px vertical padding so line 1 isn't flush against the toolbar and the bottom doesn't kiss the console divider.
+* Tests: 14 new tests in `tests/test_phase7_ide.py` (6 lint behaviours + 8 indent/dedent cases). Phase 7 file: **44 passed**.
+
 ### Phase 8 — Native helpers + Guides ✅
 Both subsystems follow the now-familiar Protocol + lazy-singleton +
 test-fake pattern. Platform SDKs (`pywin32`, `pyobjc`, `python-xlib`,
