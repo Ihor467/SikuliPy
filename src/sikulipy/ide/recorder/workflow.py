@@ -32,6 +32,12 @@ class RecorderAction(str, Enum):
     TEXT_CLICK = "text_click"
     TEXT_WAIT = "text_wait"
     TEXT_EXISTS = "text_exists"
+    # Android-only hardware-key shortcuts. Emitted as
+    # ``screen.device.key_event("KEYCODE_BACK")`` etc; the recorder bar
+    # hides these buttons unless the active surface is android.
+    BACK = "back"
+    HOME = "home"
+    RECENTS = "recents"
 
     @property
     def needs_pattern(self) -> bool:
@@ -46,6 +52,35 @@ class RecorderAction(str, Enum):
     @property
     def needs_two_patterns(self) -> bool:
         return self in {RecorderAction.DRAG_DROP, RecorderAction.SWIPE}
+
+    def applies_on(self, surface_name: str) -> bool:
+        """Return True iff this action makes sense on ``surface_name``.
+
+        ``surface_name`` is the ``TargetSurface.name`` (``"desktop"`` /
+        ``"android"`` / ``"fake"``). The recorder bar uses this to hide
+        irrelevant buttons; codegen uses it to reject mismatches.
+        """
+        if self in _ANDROID_ONLY_ACTIONS:
+            return surface_name == "android"
+        if self in _DESKTOP_ONLY_ACTIONS:
+            return surface_name != "android"
+        return True
+
+
+# Android lacks a window manager from the host's point of view: no
+# launch/close-by-window-title, no right-click. Reject these at record
+# time when an Android surface is active.
+_DESKTOP_ONLY_ACTIONS: set[RecorderAction] = {
+    RecorderAction.RCLICK,
+    RecorderAction.WHEEL,
+    RecorderAction.LAUNCH_APP,
+    RecorderAction.CLOSE_APP,
+}
+_ANDROID_ONLY_ACTIONS: set[RecorderAction] = {
+    RecorderAction.BACK,
+    RecorderAction.HOME,
+    RecorderAction.RECENTS,
+}
 
 
 class RecorderState(str, Enum):

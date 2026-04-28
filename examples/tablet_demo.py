@@ -25,6 +25,13 @@ Requires the ``android`` extra::
     uv pip install -e ".[android]"
 
 and the ``adb`` binary on PATH (``sudo apt install adb`` on Debian/Ubuntu).
+
+For interactive recording: launch the SikuliPy IDE (``sikulipy ide``),
+click **Record**, pick this device from the **Target** dropdown (USB
+devices show up after Refresh; Wi-Fi devices come in via the host:port
+field + Connect), then drag rectangles over the device frame instead of
+the host screen. Insert & Close drops in a runnable script that uses
+``ADBScreen`` exactly like the snippets below.
 """
 
 from __future__ import annotations

@@ -14,7 +14,19 @@ from sikulipy.ide.recorder.codegen import (
     PythonGenerator,
     default_generator,
 )
+from sikulipy.ide.recorder.devices import (
+    DESKTOP_ENTRY_KEY,
+    DeviceEntry,
+    DevicePicker,
+)
 from sikulipy.ide.recorder.session import RecorderSession
+from sikulipy.ide.recorder.surface import (
+    TargetSurface,
+    _AndroidSurface,
+    _DesktopSurface,
+    _FakeSurface,
+    default_surface,
+)
 from sikulipy.ide.recorder.workflow import (
     RecorderAction,
     RecorderState,
@@ -23,10 +35,18 @@ from sikulipy.ide.recorder.workflow import (
 
 __all__ = [
     "CodeGenerator",
+    "DESKTOP_ENTRY_KEY",
+    "DeviceEntry",
+    "DevicePicker",
     "PythonGenerator",
     "RecorderAction",
     "RecorderSession",
     "RecorderState",
     "RecorderWorkflow",
+    "TargetSurface",
+    "_AndroidSurface",
+    "_DesktopSurface",
+    "_FakeSurface",
     "default_generator",
+    "default_surface",
 ]

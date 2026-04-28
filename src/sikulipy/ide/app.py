@@ -24,12 +24,20 @@ from pathlib import Path
 import flet as ft
 
 from sikulipy import __version__
-from sikulipy.ide.capture_overlay import pick_region_and_save
+from sikulipy.ide.capture_overlay import (
+    pick_region_and_save,
+    surface_frame_provider,
+)
 from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry
 from sikulipy.ide.editor import EditorDocument
 from sikulipy.ide.explorer import ScriptTreeNode, build_tree
 from sikulipy.ide.lint import Diagnostic, lint_text
-from sikulipy.ide.recorder import RecorderAction, RecorderSession
+from sikulipy.ide.recorder import (
+    DESKTOP_ENTRY_KEY,
+    DevicePicker,
+    RecorderAction,
+    RecorderSession,
+)
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
 from sikulipy.ide.toolbar import DefaultRunnerHost, ToolbarActions
@@ -69,6 +77,9 @@ class _IDEState:
         self.selected_pattern: Path | None = None
         # Active recorder session, or None when not recording.
         self.recorder: RecorderSession | None = None
+        # Device picker bound to ``self.recorder`` while a session is
+        # live; rebuilt every time the recorder is (re)opened.
+        self.device_picker: "DevicePicker | None" = None
         # Last-selected tab in the recorder bar; preserved across the
         # full layout rebuilds triggered by Insert Code / refresh().
         self.recorder_tab_index: int = 0
@@ -101,6 +112,40 @@ values caught the IDE in the screenshot intermittently."""
 _IMPORT_TRIGGERS: list[tuple[str, str]] = [
     ("App.", "from sikulipy.natives import App"),
 ]
+
+
+def _ensure_session_header(state: "_IDEState", session: "RecorderSession") -> None:
+    """Prepend the active recorder surface's imports and setup lines.
+
+    Called once per ``_auto_insert`` so the buffer always carries the
+    surface header that the recorded code is going to dispatch through.
+    Each line is matched as a substring against the current buffer to
+    decide if it's missing — same shape as :func:`_ensure_imports_for`,
+    but driven by the surface (``_AndroidSurface.header_setup`` →
+    ``screen = ADBScreen.start(serial="...")``) rather than a static
+    table. Desktop surfaces emit no setup, so this is a no-op for the
+    common path.
+    """
+    text = state.document.text
+    needed_imports = [ln for ln in session.required_imports() if ln not in text]
+    needed_setup = [ln for ln in session.required_setup() if ln not in text]
+    if not needed_imports and not needed_setup:
+        return
+    parts: list[str] = []
+    if needed_imports:
+        parts.append("\n".join(needed_imports))
+    if needed_setup:
+        # Blank line separating imports from setup keeps the inserted
+        # block readable when the caller's file is empty.
+        parts.append("\n".join(needed_setup))
+    block = "\n\n".join(parts) + "\n"
+    insert_at = 0
+    if text.startswith("#!"):
+        nl = text.find("\n")
+        insert_at = nl + 1 if nl != -1 else len(text)
+    state.document.insert(block, at=insert_at)
+    if state.document.cursor >= insert_at:
+        state.document.cursor += len(block)
 
 
 def _ensure_imports_for(state: "_IDEState", code: str) -> None:
@@ -319,10 +364,17 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
     def _record_click(_e):
         if state.recorder is None:
             state.recorder = RecorderSession()
+            state.device_picker = DevicePicker(session=state.recorder)
+            # Best-effort initial refresh so the dropdown lists USB
+            # devices that were already plugged in when the recorder
+            # opened. Errors (no adb, no pure-python-adb) are absorbed
+            # by ``DevicePicker.refresh`` and surfaced as last_error.
+            state.device_picker.refresh()
             state.status.set_message("Recording — use buttons under the editor")
         else:
             state.recorder.discard()
             state.recorder = None
+            state.device_picker = None
             state.status.set_message("Recording cancelled")
         refresh()
 
@@ -981,10 +1033,109 @@ def _prompt_payload(page: ft.Page, prompt: str, on_ok) -> None:
     on_ok(value or "")
 
 
+def _build_device_row(state: _IDEState, refresh: callable) -> ft.Row | None:
+    """Top row of the recorder bar: target-device dropdown + Refresh + IP.
+
+    Lets the user record against either the desktop or an attached
+    Android device. All ADB calls go through ``state.device_picker``,
+    which absorbs missing-deps / connection errors so the row never
+    crashes the recorder. Returns ``None`` when the recorder isn't
+    active (defensive — caller already checks)."""
+    picker = state.device_picker
+    if picker is None:
+        return None
+
+    options = [
+        ft.dropdown.Option(key=entry.key, text=entry.label)
+        for entry in picker.entries
+    ]
+    dropdown = ft.Dropdown(
+        value=picker.selected_key,
+        options=options,
+        dense=True,
+        width=240,
+    )
+
+    def _on_change(_e: ft.ControlEvent) -> None:
+        try:
+            picker.select(dropdown.value or DESKTOP_ENTRY_KEY)
+            target = "desktop" if dropdown.value == DESKTOP_ENTRY_KEY else dropdown.value
+            state.status.set_message(f"Recorder target: {target}")
+        except Exception as exc:
+            state.status.set_message(f"Device select failed: {exc}")
+        refresh()
+
+    dropdown.on_change = _on_change
+
+    def _on_refresh(_e: ft.ControlEvent) -> None:
+        picker.refresh()
+        if picker.last_error:
+            state.status.set_message(f"ADB: {picker.last_error}")
+        else:
+            n = max(0, len(picker.entries) - 1)  # exclude desktop
+            state.status.set_message(f"ADB devices: {n}")
+        refresh()
+
+    address_field = ft.TextField(
+        hint_text="host[:port]",
+        dense=True,
+        width=180,
+    )
+
+    def _on_connect(_e: ft.ControlEvent) -> None:
+        addr = (address_field.value or "").strip()
+        if not addr:
+            state.status.set_message("Enter host[:port] to connect over WiFi")
+            return
+        try:
+            entry = picker.connect_address(addr)
+            state.status.set_message(f"Connected: {entry.serial}")
+            address_field.value = ""
+        except Exception as exc:
+            state.status.set_message(f"Connect failed: {exc}")
+        refresh()
+
+    return ft.Row(
+        controls=[
+            ft.Text("Target:", size=12),
+            dropdown,
+            ft.IconButton(
+                icon=ft.Icons.REFRESH,
+                tooltip="Refresh ADB devices",
+                on_click=_on_refresh,
+            ),
+            ft.Container(width=12),
+            address_field,
+            ft.ElevatedButton(
+                "Connect",
+                icon=ft.Icons.WIFI,
+                on_click=_on_connect,
+            ),
+        ],
+        spacing=6,
+        wrap=True,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+
+
 def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Container | None:
     if state.recorder is None:
         return None
     session = state.recorder
+
+    def _capture_for_session() -> Path | None:
+        """Run :func:`pick_region_and_save` against whatever surface the
+        session currently targets. The desktop path still hides the IDE
+        so it doesn't end up in the screenshot; Android captures grab
+        the device's own framebuffer over ADB and don't need that."""
+        provider = None
+        is_desktop = session.surface.name == "desktop"
+        if not is_desktop:
+            provider = surface_frame_provider(session.surface)
+        if is_desktop:
+            with _ide_hidden(page):
+                return pick_region_and_save(state.root, frame_provider=provider)
+        return pick_region_and_save(state.root, frame_provider=provider)
 
     def _record_pattern(action: RecorderAction):
         def handler(_e):
@@ -997,11 +1148,10 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
 
             saved: Path | None = None
             try:
-                with _ide_hidden(page):
-                    try:
-                        saved = pick_region_and_save(state.root)
-                    except Exception as exc:
-                        state.status.set_message(f"Capture failed: {exc}")
+                try:
+                    saved = _capture_for_session()
+                except Exception as exc:
+                    state.status.set_message(f"Capture failed: {exc}")
             finally:
                 session.workflow.finish()
 
@@ -1018,11 +1168,10 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
 
     def _capture_one(label: str) -> Path | None:
         saved: Path | None = None
-        with _ide_hidden(page):
-            try:
-                saved = pick_region_and_save(state.root)
-            except Exception as exc:
-                state.status.set_message(f"Capture failed ({label}): {exc}")
+        try:
+            saved = _capture_for_session()
+        except Exception as exc:
+            state.status.set_message(f"Capture failed ({label}): {exc}")
         return saved
 
     def _record_two_patterns(action: RecorderAction):
@@ -1126,7 +1275,10 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         n_lines = len([ln for ln in code.splitlines() if ln])
         # Make sure any imports the recorded code needs are present at
         # the top of the file, before computing the caret position
-        # (since adding the import shifts existing offsets).
+        # (since adding the import shifts existing offsets). Surface
+        # header (``screen = ADBScreen.start(...)`` etc.) goes in
+        # first, then substring-keyed imports for the snippet itself.
+        _ensure_session_header(state, session)
         _ensure_imports_for(state, code)
         # Insert at the editor's caret. Prepend a newline if the caret
         # is mid-line, append one if anything follows the insertion.
@@ -1146,6 +1298,7 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
     def _close(_e):
         session.discard()
         state.recorder = None
+        state.device_picker = None
         state.status.set_message("Recorder closed")
         refresh()
 
@@ -1234,9 +1387,16 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         spacing=6,
     )
 
+    device_row = _build_device_row(state, refresh)
+
+    column_controls: list[ft.Control] = []
+    if device_row is not None:
+        column_controls.append(device_row)
+    column_controls.extend([tabs, footer])
+
     return ft.Container(
         content=ft.Column(
-            controls=[tabs, footer],
+            controls=column_controls,
             spacing=4,
             expand=True,
         ),

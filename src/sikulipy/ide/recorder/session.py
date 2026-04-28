@@ -24,6 +24,7 @@ from sikulipy.ide.recorder.codegen import (
     GenInput,
     default_generator,
 )
+from sikulipy.ide.recorder.surface import TargetSurface, default_surface
 from sikulipy.ide.recorder.workflow import RecorderAction, RecorderWorkflow
 
 
@@ -39,9 +40,28 @@ class RecordedLine:
 class RecorderSession:
     generator: CodeGenerator = field(default_factory=default_generator)
     workflow: RecorderWorkflow = field(default_factory=RecorderWorkflow)
+    surface: TargetSurface = field(default_factory=default_surface)
     on_change: Callable[[], None] | None = None
     _lines: list[RecordedLine] = field(default_factory=list, repr=False)
     _tmpdir: Path | None = field(default=None, repr=False)
+
+    # ---- Surface ---------------------------------------------------
+    def set_surface(self, surface: TargetSurface, *, drop_lines: bool = True) -> None:
+        """Bind the session to a new recording surface.
+
+        By default ``drop_lines`` clears the preview because lines
+        recorded against the previous surface use a different dispatch
+        verb (``Screen().click`` vs ``screen.click``) and would no
+        longer match the new finalize header. Tests / callers that know
+        what they're doing can pass ``drop_lines=False`` to preserve
+        them.
+        """
+        if self.surface is surface:
+            return
+        self.surface = surface
+        if drop_lines:
+            self._lines.clear()
+            self._notify()
 
     # ---- Temp dir ---------------------------------------------------
     def temp_dir(self) -> Path:
@@ -69,7 +89,10 @@ class RecorderSession:
         if not action.needs_pattern:
             raise ValueError(f"{action.value} does not take a pattern")
         gi = GenInput(
-            pattern=pattern_path.name, timeout=timeout, similarity=similarity
+            pattern=pattern_path.name,
+            timeout=timeout,
+            similarity=similarity,
+            surface=self.surface.name,
         )
         code = self.generator.generate(action, gi)
         line = RecordedLine(action=action, code=code, pattern_path=pattern_path)
@@ -82,7 +105,7 @@ class RecorderSession:
     ) -> RecordedLine:
         if action.needs_pattern or action.needs_two_patterns:
             raise ValueError(f"{action.value} requires a pattern, not a payload")
-        gi = GenInput(payload=payload)
+        gi = GenInput(payload=payload, surface=self.surface.name)
         code = self.generator.generate(action, gi)
         line = RecordedLine(action=action, code=code)
         self._lines.append(line)
@@ -104,6 +127,7 @@ class RecorderSession:
             pattern2=dst_path.name,
             timeout=timeout,
             similarity=similarity,
+            surface=self.surface.name,
         )
         code = self.generator.generate(action, gi)
         line = RecordedLine(
@@ -155,6 +179,19 @@ class RecorderSession:
         if joined and not joined.endswith("\n"):
             joined += "\n"
         return joined, moved
+
+    def required_imports(self) -> list[str]:
+        """Imports the active surface's emitted code needs at the top of
+        the script. Caller (the IDE) is responsible for skipping ones
+        already present."""
+        return list(self.surface.header_imports())
+
+    def required_setup(self) -> list[str]:
+        """Statements the active surface needs *after* the imports —
+        for Android this is ``screen = ADBScreen.start(...)`` /
+        ``ADBScreen.connect(...)``. Empty for desktop. The IDE inserts
+        them once per script: deduped against the existing buffer."""
+        return list(self.surface.header_setup())
 
     # ---- Internals --------------------------------------------------
     def _notify(self) -> None:

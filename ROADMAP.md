@@ -152,6 +152,90 @@ stays lean and headless CI never triggers them.
 * `pyproject.toml` — new `app` extra (`pywin32` / `pyobjc-framework-{Cocoa,Quartz}` / `python-xlib` + `ewmh`, each environment-marker-gated)
 * Tests: 26 tests in `tests/test_phase8_natives.py` + `tests/test_phase8_guide.py`; routing verified with `RecordingBackend` / `RecordingGuideBackend`; cv2-based pixel assertions gated on `pytest.importorskip("cv2", exc_type=ImportError)` so the suite still passes on CPUs without NumPy 2.x support.
 
+### Phase 9 — Recorder ↔ Android integration ✅
+Shipped: open the recorder, pick an attached ADB device (USB) or
+connect over Wi-Fi via the host:port field, and every captured pattern
+/ payload is bound to that device's framebuffer instead of the host
+screen. Insert & Close prepends `from sikulipy.android.screen import
+ADBScreen` and a `screen = ADBScreen.start(serial=...)` (or
+`ADBScreen.connect("ip:port")`) so the saved snippet runs unchanged.
+
+* `recorder/surface.py` — `TargetSurface` Protocol, `_DesktopSurface`, `_AndroidSurface`, `_FakeSurface`, `default_surface()`.
+* `recorder/codegen.py` — surface-aware dispatch; desktop emits `wait(...).click()`, Android emits `screen.click(...)`.
+* `recorder/devices.py` — headless `DevicePicker` with `refresh()` / `select()` / `connect_address()`. Errors absorbed (no `pure-python-adb`, no adb server) so the recorder still runs on plain desktops.
+* `recorder/workflow.py` — `RecorderAction.{BACK,HOME,RECENTS}` android-only verbs; `applies_on(surface_name)` rejects mismatches at codegen time.
+* `ide/capture_overlay.py:surface_frame_provider` bridges a surface's BGR frame to the Tk overlay; non-desktop captures skip the IDE-hide step.
+* `ide/app.py` — recorder bar gains a Target/Refresh/Connect row; `_ensure_session_header` injects the surface's `header_imports()` + `header_setup()` once per script during `_auto_insert`.
+* Tests: 25 codegen + 12 picker + 4 overlay + 5 finalize + 11 surface = 57 new (`tests/test_phase9_*.py`).
+
+Below is the original step-by-step plan, kept for reference.
+
+Goal: let the Record button drive a tablet/phone the same way it drives
+the desktop today. The user picks a device once, then every "Click /
+Wait / Type / Drag" action targets the device's framebuffer instead of
+the host screen, and the saved snippet runs against `ADBScreen` rather
+than `Screen`.
+
+Design constraints:
+
+* Reuse the existing recorder workflow (`RecorderAction`, `RecorderSession`, `PythonGenerator`) — no parallel UI.
+* Stay headless-testable: the device is a `TargetSurface` Protocol with `_DesktopSurface` (current behaviour) and `_AndroidSurface` implementations + a `_FakeSurface` for tests. Nothing in `recorder/` touches `cv2` or `adb` directly.
+* Don't load the `android` extra unless the user picks Android in the recorder. Lazy import + Protocol-resolved factory.
+* Code generation switches by surface, not by per-action flags. A single recording is bound to one surface for its whole lifetime.
+
+#### Step 1 — Target surface abstraction
+* `ide/recorder/surface.py` (new) — `TargetSurface` Protocol with:
+  * `screenshot() -> Path` (writes a PNG to the recorder temp dir, returns the path; the existing capture-overlay flow is built on this).
+  * `bounds() -> tuple[int, int, int, int]` (x, y, w, h) so the overlay knows where to draw the picker.
+  * `header_imports() -> list[str]` (extra `import` lines the generator's header should emit).
+  * `name: str` (`"desktop"` / `"android"`) — recorded in `RecordedLine` and used by codegen to pick the dispatch verb.
+* `ide/recorder/surface.py:_DesktopSurface` — wraps the current `mss` + capture-overlay path. No behavioural change vs today.
+* `ide/recorder/surface.py:_AndroidSurface` — wraps an `ADBScreen`; `screenshot()` calls `device.screencap_png()` and writes it; `bounds()` is `(0, 0, w, h)`.
+* `RecorderSession.__init__` gains `surface: TargetSurface = _DesktopSurface()`. `generator.header()` is replaced by `surface.header_imports() + generator.header()` so an Android recording starts with `from sikulipy.android.screen import ADBScreen` + `screen = ADBScreen.start()`.
+
+#### Step 2 — Surface-aware code generation
+* `recorder/codegen.py:GenInput` gains `surface: str = "desktop"`.
+* `PythonGenerator.generate` routes through a surface dispatch table:
+  * Desktop → emits today's `wait(Pattern(...), t).click()` / `dragDrop(...)` / `type(...)`.
+  * Android → emits `screen.click(Pattern(...))` / `screen.drag_drop(...)` / `screen.type(...)` / `screen.swipe(src, dst, duration_ms=…)` (already supported by `ADBScreen`).
+* Actions without an Android equivalent (`LAUNCH_APP`, `CLOSE_APP`) get rejected at record time when `surface == "android"`, with the reason surfaced in the recorder bar's status line. `KEY_COMBO` falls back to `screen.key_event(...)` for special keys; modifier combos are unsupported on Android and get the same rejection.
+* New action: `BACK` / `HOME` / `RECENTS` emitted only on Android. They take no payload, expand to `screen.device.key_event("KEYCODE_BACK")` etc. Action enum gets a `surface_only: str | None` attribute (None = both, `"android"` = Android only) so the recorder bar can hide the buttons that don't apply.
+
+#### Step 3 — Device picker UI
+* New top-level toolbar control in the recorder bar: a `Dropdown` listing **Desktop** + every detected ADB device (label = `serial · model`, model fetched lazily via `getprop ro.product.model`). Default is **Desktop** so the existing flow is unchanged for users who never plug in a device.
+* Refresh button next to the dropdown re-runs `ADBClient().devices()`. New devices show up without restarting the IDE.
+* Selecting a device calls `RecorderSession.set_surface(_AndroidSurface(device))`. Existing recorded lines are dropped (with a confirmation in the recorder bar) because they were written against the old surface.
+* If the user types an IP into the dropdown's free-form field (e.g. `192.168.1.5:5555`), the picker calls `ADBClient.connect(...)` first and adds the resulting device.
+* The toolbar's existing **Capture** button stays desktop-only. Recorder-driven captures route through the surface so when Android is selected they hit `screencap_png` instead of `mss`.
+
+#### Step 4 — Capture overlay against device frames
+* `ide/capture_overlay.pick_region_and_save` currently grabs the desktop with `mss`. Refactor it to take an injected `frame_provider: Callable[[], np.ndarray]` (default = current `mss` path). When Android is selected the recorder hands it `lambda: device.screencap().bitmap`.
+* Overlay window stays a desktop Flet window — there's no reason to mirror the device. The picker shows the device frame as a static backdrop and the user drags a rectangle over it. Coordinates are reported in device pixels (frame already is device-native).
+* Edge case: device DPI / orientation can change mid-recording. Re-grab the frame on each new pattern, never cache.
+
+#### Step 5 — Finalize: write a runnable script
+* `RecorderSession.finalize` already moves PNGs next to the script. Extend it to:
+  * Prepend `surface.header_imports()` to the joined source.
+  * For Android: insert a single `screen = ADBScreen.start()` (or `.connect("…")` if the recording was bound to a Wi-Fi address) right after the imports, and rewrite every action call to use `screen` as the receiver.
+  * Inject a `Settings.image_path = str(Path(__file__).parent / "patterns")` so the generated script finds the captured PNGs when run from anywhere.
+* Bundle layout for Android recordings: `foo_android.sikuli/foo_android.py` + a sibling `patterns/` dir, mirroring desktop bundles.
+
+#### Step 6 — Tests
+* `tests/test_phase9_surface.py` — `_DesktopSurface` / `_AndroidSurface` + `_FakeSurface`; `header_imports`, `screenshot`, bounds; recording session honours the surface across `record_pattern` / `record_payload` / `record_two_patterns`.
+* `tests/test_phase9_codegen.py` — codegen routes through the surface: same `RecorderAction.CLICK` produces `wait(...).click()` on desktop and `screen.click(Pattern(...))` on Android; Android-only actions (`BACK`/`HOME`/`RECENTS`) raise on desktop.
+* `tests/test_phase9_picker.py` — `RecorderSession.set_surface` swaps the surface, clears prior lines, and is idempotent. Uses a fake `ADBClient` that returns a recording device — no real adb server needed.
+* No new device-bound integration tests required; the existing fake-backend pattern from Phase 4 covers the ADB side.
+
+#### Step 7 — Docs
+* Extend `examples/tablet_demo.py` with a comment block pointing at the recorder once Phase 9 ships ("for interactive recording, pick this device in the IDE's Recorder dropdown").
+* New `docs/recorder_android.md` (only if the README grows past one screen) walking through: enable USB debugging → plug in → IDE → Record → choose device → tap targets → Insert & Close → run.
+
+#### Risks & open questions
+* **Mid-recording surface switch.** Current plan is to drop prior lines. Alternative: keep them and let codegen apply the new surface during finalize, but that breaks if the recorded actions reference desktop-only verbs (`KEY_COMBO`, `LAUNCH_APP`). Drop-on-switch is simpler and matches user expectation.
+* **Wireless-debug pairing.** Android 11+ pairing flow needs `adb pair` first, which the IDE doesn't drive. For now the dropdown's free-form field accepts only an `IP:PORT` that's already paired; surfacing a pair dialog is a follow-up.
+* **Multi-display devices.** `ADBScreen` covers display 0 only. Foldables and connected secondary displays will need a `display_id` argument on `ADBScreen.start` before the recorder can target them.
+* **Performance.** Each recorded action triggers a fresh `screencap` (~50–250 ms over USB, longer over Wi-Fi). For long sessions this is fine; if it bites we can re-introduce the Phase 1 cached-bitmap behaviour and only re-screencap when the user opens the picker.
+
 ## Out of scope (for now)
 
 * MCP module — Java-specific, superseded by Python MCP SDKs

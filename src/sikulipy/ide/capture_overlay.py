@@ -24,8 +24,22 @@ fighting the Flet window for keyboard focus.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 from sikulipy.ide.capture import CaptureRect
+
+if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
+
+    from sikulipy.ide.recorder.surface import TargetSurface
+
+# A frame provider returns ``(image, virtual_bounds)`` where
+# ``virtual_bounds`` is the same ``{"left", "top", "width", "height"}``
+# dict that mss uses for monitor 0. Desktop captures use the host's
+# virtual screen geometry; surface-driven captures (Android) use
+# ``{"left": 0, "top": 0, ...}`` because device coords already start
+# at the origin.
+FrameProvider = Callable[[], "tuple[PILImage, dict]"]
 
 
 def _grab_fullscreen():
@@ -41,6 +55,31 @@ def _grab_fullscreen():
     # already the correctly-ordered RGB bytes.
     img = Image.frombytes("RGB", raw.size, raw.rgb)
     return img, mon
+
+
+def surface_frame_provider(surface: "TargetSurface") -> FrameProvider:
+    """Bridge a :class:`TargetSurface` to a :data:`FrameProvider`.
+
+    Desktop surfaces still go through ``_grab_fullscreen`` so the
+    overlay sees the virtual-screen union and the user can drag across
+    monitor boundaries. Non-desktop surfaces (e.g. ``_AndroidSurface``)
+    return their BGR ndarray, which we convert to RGB PIL once per
+    capture; their virtual-bounds dict starts at the origin since the
+    device frame is its own coordinate system."""
+    if getattr(surface, "name", "") == "desktop":
+        return _grab_fullscreen
+
+    def _provide() -> "tuple[PILImage, dict]":
+        import cv2
+        from PIL import Image
+
+        bgr = surface.frame()
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        img = Image.fromarray(rgb)
+        return img, {"left": 0, "top": 0, "width": int(w), "height": int(h)}
+
+    return _provide
 
 
 def _run_overlay(bg_image) -> CaptureRect | None:
@@ -250,15 +289,24 @@ def _safe_stem(name: str) -> str:
     return base or "capture"
 
 
-def pick_region_and_save(project_root: Path) -> Path | None:
+def pick_region_and_save(
+    project_root: Path,
+    frame_provider: FrameProvider | None = None,
+) -> Path | None:
     """Run the full capture flow; return the saved PNG path, or None.
+
+    ``frame_provider`` defaults to :func:`_grab_fullscreen` (desktop
+    capture). Pass :func:`surface_frame_provider` when recording
+    against an Android device — the overlay then displays the device
+    screencap as the drag canvas, and the saved crop is in device
+    coordinates.
 
     Raises only for genuine environment failures (no display, mss/PIL
     missing). User cancellation at any step returns ``None``.
     """
-    from PIL import Image
-
-    bg, mon = _grab_fullscreen()
+    if frame_provider is None:
+        frame_provider = _grab_fullscreen
+    bg, mon = frame_provider()
     rect = _run_overlay(bg)
     if rect is None:
         return None

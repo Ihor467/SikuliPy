@@ -23,7 +23,10 @@ class GenInput:
     is required for image-bearing actions. ``payload`` carries the
     text/key/seconds for non-pattern actions. ``timeout`` is the wait
     upper bound; ``similarity`` is an optional override (``None`` =
-    leave the call to default similarity).
+    leave the call to default similarity). ``surface`` selects which
+    dispatch verbs the generator emits (``"desktop"`` →
+    ``Screen().click(...)`` style; ``"android"`` →
+    ``screen.click(...)``).
     """
 
     pattern: str | None = None
@@ -31,6 +34,7 @@ class GenInput:
     payload: str | None = None
     timeout: float = 10.0
     similarity: float | None = None
+    surface: str = "desktop"
 
 
 class CodeGenerator(Protocol):
@@ -57,6 +61,15 @@ class PythonGenerator:
         return "from sikulipy import *\n"
 
     def generate(self, action: RecorderAction, gi: GenInput) -> str:
+        if not action.applies_on(gi.surface):
+            raise ValueError(
+                f"{action.value!r} is not available on the {gi.surface} surface"
+            )
+        if gi.surface == "android":
+            return self._gen_android(action, gi)
+        return self._gen_desktop(action, gi)
+
+    def _gen_desktop(self, action: RecorderAction, gi: GenInput) -> str:
         if action.needs_pattern:
             if not gi.pattern:
                 raise ValueError(f"{action.value} needs a pattern")
@@ -131,6 +144,76 @@ class PythonGenerator:
             if not gi.payload:
                 raise ValueError("text_exists needs a payload")
             return f"exists(findText({_py_str(gi.payload)}), {_fmt_num(gi.timeout)})"
+
+        raise ValueError(f"unknown action: {action}")
+
+    def _gen_android(self, action: RecorderAction, gi: GenInput) -> str:
+        # Android dispatches through a session-bound ``screen`` variable
+        # (the finalize step injects ``screen = ADBScreen.start()`` /
+        # ``connect(...)``). Pattern-bearing actions skip the desktop
+        # ``wait()`` wrapper because ADBScreen.click already does
+        # find-and-tap; an explicit wait would double-grab.
+        if action.needs_pattern:
+            if not gi.pattern:
+                raise ValueError(f"{action.value} needs a pattern")
+            pat = _pattern_expr(gi.pattern, gi.similarity)
+            t = _fmt_num(gi.timeout)
+            if action is RecorderAction.CLICK:
+                return f"screen.click({pat})"
+            if action is RecorderAction.DBLCLICK:
+                return f"screen.double_click({pat})"
+            if action is RecorderAction.WAIT:
+                return f"screen.wait({pat}, {t})"
+            if action is RecorderAction.WAIT_VANISH:
+                return f"screen.wait_vanish({pat}, {t})"
+
+        if action.needs_two_patterns:
+            if not gi.pattern or not gi.pattern2:
+                raise ValueError(f"{action.value} needs two patterns")
+            src = _pattern_expr(gi.pattern, gi.similarity)
+            dst = _pattern_expr(gi.pattern2, gi.similarity)
+            if action is RecorderAction.DRAG_DROP:
+                return f"screen.drag_drop({src}, {dst})"
+            if action is RecorderAction.SWIPE:
+                return f"screen.swipe({src}, {dst})"
+
+        if action is RecorderAction.TYPE:
+            return f"screen.type({_py_str(gi.payload or '')})"
+        if action is RecorderAction.PAUSE:
+            secs = gi.payload or "1"
+            return f"sleep({_fmt_num(float(secs))})"
+        if action is RecorderAction.KEY_COMBO:
+            if not gi.payload:
+                raise ValueError("key_combo needs a payload")
+            # Android has no chord/modifier semantics; only the final key
+            # token survives, mapped to a KEYCODE_* via Android's table.
+            parts = [p.strip() for p in gi.payload.split("+") if p.strip()]
+            if not parts:
+                raise ValueError("key_combo payload is empty")
+            *_mods, key = parts
+            keycode = f"KEYCODE_{key.upper()}"
+            return f'screen.device.key_event("{keycode}")'
+        if action is RecorderAction.BACK:
+            return 'screen.device.key_event("KEYCODE_BACK")'
+        if action is RecorderAction.HOME:
+            return 'screen.device.key_event("KEYCODE_HOME")'
+        if action is RecorderAction.RECENTS:
+            return 'screen.device.key_event("KEYCODE_APP_SWITCH")'
+        if action is RecorderAction.TEXT_CLICK:
+            if not gi.payload:
+                raise ValueError("text_click needs a payload")
+            return f"screen.click(screen.find_text({_py_str(gi.payload)}))"
+        if action is RecorderAction.TEXT_WAIT:
+            if not gi.payload:
+                raise ValueError("text_wait needs a payload")
+            return (
+                f"screen.wait_text({_py_str(gi.payload)}, "
+                f"{_fmt_num(gi.timeout)})"
+            )
+        if action is RecorderAction.TEXT_EXISTS:
+            if not gi.payload:
+                raise ValueError("text_exists needs a payload")
+            return f"screen.has_text({_py_str(gi.payload)})"
 
         raise ValueError(f"unknown action: {action}")
 
