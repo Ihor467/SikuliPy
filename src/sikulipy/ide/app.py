@@ -473,8 +473,8 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         icon=ft.Icons.PHONE_ANDROID,
         tooltip="Recording target / Wi-Fi pairing",
         items=[
-            ft.PopupMenuItem(text="Switch target…", on_click=_devices_switch),
-            ft.PopupMenuItem(text="Pair Wi-Fi device…", on_click=_devices_pair),
+            ft.PopupMenuItem(content="Switch target…", on_click=_devices_switch),
+            ft.PopupMenuItem(content="Pair Wi-Fi device…", on_click=_devices_pair),
         ],
         visible=recording,
     )
