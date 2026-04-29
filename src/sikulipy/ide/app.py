@@ -1107,8 +1107,9 @@ def _build_device_row(state: _IDEState, refresh: callable) -> ft.Row | None:
             ft.Container(width=12),
             address_field,
             ft.ElevatedButton(
-                "Connect",
+                "Pair Wi-Fi device",
                 icon=ft.Icons.WIFI,
+                tooltip="Run adb connect host[:port] to add a new wireless device",
                 on_click=_on_connect,
             ),
         ],
