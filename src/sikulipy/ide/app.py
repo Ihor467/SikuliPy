@@ -1095,6 +1095,12 @@ def _build_device_row(state: _IDEState, refresh: callable) -> ft.Row | None:
             state.status.set_message(f"Connect failed: {exc}")
         refresh()
 
+    # Green WIFI when an Android device is the active surface; grey
+    # while the recorder is still pointed at the desktop. Single-glance
+    # indicator that the next captured action will land on the tablet.
+    connected = picker.selected_key != DESKTOP_ENTRY_KEY
+    wifi_color = ft.Colors.GREEN_700 if connected else ft.Colors.GREY_500
+
     return ft.Row(
         controls=[
             ft.Text("Target:", size=12),
@@ -1109,6 +1115,7 @@ def _build_device_row(state: _IDEState, refresh: callable) -> ft.Row | None:
             ft.ElevatedButton(
                 "Pair Wi-Fi device",
                 icon=ft.Icons.WIFI,
+                icon_color=wifi_color,
                 tooltip="Run adb connect host[:port] to add a new wireless device",
                 on_click=_on_connect,
             ),
