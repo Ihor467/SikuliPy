@@ -236,6 +236,93 @@ Design constraints:
 * **Multi-display devices.** `ADBScreen` covers display 0 only. Foldables and connected secondary displays will need a `display_id` argument on `ADBScreen.start` before the recorder can target them.
 * **Performance.** Each recorded action triggers a fresh `screencap` (~50–250 ms over USB, longer over Wi-Fi). For long sessions this is fine; if it bites we can re-introduce the Phase 1 cached-bitmap behaviour and only re-screencap when the user opens the picker.
 
+### Phase 10 — Action logging in the IDE Console
+
+Goal: while a script runs from the IDE, every interaction (click,
+type, find, wait, drag, swipe, app launch, etc.) appears as a
+human-readable line in the Console pane so the user can watch what the
+script is doing and debug from the log without sprinkling `print()`
+calls. Logging stays opt-in at runtime via a level knob, never affects
+return values, and degrades to a no-op when the IDE isn't driving the
+runner (so plain `python script.py` users don't suddenly get noisy
+output).
+
+#### Design
+
+* **Single logger, structured records.** `sikulipy/util/action_log.py`
+  — new module exposing `ActionLogger`, `ActionRecord(category, verb,
+  target, result, duration_ms, surface)`, and a module-level singleton
+  reachable via `get_action_logger()`. Logger has `level`
+  (`off|action|verbose`) and a list of `Sink` callables. Default level
+  `off` so headless callers see nothing.
+* **No `logging.getLogger` indirection.** The codebase has no existing
+  logging conventions — adding one logger here keeps the surface
+  small. We can graduate to `logging` later if more subsystems want
+  structured output.
+* **Instrumentation by decorator, not edit-every-method.** New
+  `@logged_action(category, verb)` decorator in
+  `sikulipy/util/action_log.py` wraps a bound method, computes the
+  target description from arguments (`Pattern("ok.png", 0.7)`,
+  `"hello"`, etc.), times the call, and emits one record on entry
+  ("→") + one on exit ("✓ in 42 ms" / "✗ FindFailed"). Applied to:
+  * `core/region.py` — `find`, `find_all`, `wait`, `wait_vanish`,
+    `exists`, `click`, `double_click`, `right_click`, `hover`,
+    `drag_drop`, `type`, `text`, `find_text`, `find_all_text`.
+  * `core/mouse.py` — `click`, `double_click`, `right_click`,
+    `drag_drop`, `move`, `wheel`.
+  * `android/screen.py` — same click/type family + `swipe`, `back`,
+    `home`, `recents`, `find_text_coordinates`.
+  * `natives/app.py` — `App.open`, `App.focus`, `App.close`.
+* **Console sink.** `ide/toolbar.py:_DefaultRunnerHost.run` enables
+  the logger before `run_file` and disables on finally. The sink
+  formats records as `[12:34:56.789] click Pattern("ok.png") @
+  Region(…) in 42 ms` and writes them via `console.write("stdout",
+  …)` so they interleave with the script's own `print()` output.
+* **Level toggle.** Status-bar dropdown next to the lint chip
+  (`off / action / verbose`); persisted via Flet's
+  `client_storage`. `verbose` adds find-attempt counts and capture
+  bytes; `action` only emits the start/end pair. `off` short-circuits
+  the decorator with one `if level == OFF: return fn(...)` branch so
+  the perf cost on benchmark loops is one attribute lookup.
+* **Console capacity.** `ConsoleBuffer` is a 2000-entry ring buffer
+  (`ide/console.py`); a tight find-loop can saturate it. Two mitigations:
+  bump the cap to 10 000 when level ≥ action, and coalesce identical
+  consecutive records (`× 47` suffix) at sink time.
+* **Recorded code is unaffected.** Logging is a runtime concern; the
+  recorder still emits the same `screen.click(Pattern(...))` source.
+
+#### Risks & open questions
+
+* **Decorator vs. shim.** A class-level decorator means we touch every
+  Region-family file once, and the wrapped method's docstring/typing
+  is preserved via `functools.wraps`. The alternative — a single
+  proxy class — collides with subclassing (`Screen extends Region`).
+  Decorator is the simpler call.
+* **Threading.** The runner runs on a daemon thread; `console.write`
+  is already thread-safe (deque + listener fan-out under the GIL).
+  Logger sink list mutations must be guarded — single `threading.Lock`
+  inside `ActionLogger`.
+* **Find-loop noise.** Even at `action` level a `wait(timeout=10)`
+  emits one record at start and one at finish; the *internal* tight
+  retry loop stays silent. `verbose` is the level that surfaces every
+  `_find_once` attempt.
+* **Performance budget.** Target: `off` level adds < 1 µs per
+  decorated call; `action` level adds < 10 µs (one f-string + one
+  deque append). Benchmark via `tests/test_phase10_perf.py` before
+  declaring the phase done.
+
+#### Tests
+
+* `tests/test_phase10_action_log.py` — unit tests for the logger:
+  level filtering, duration timing (mocked clock), record formatting,
+  coalescing, sink-list thread safety.
+* `tests/test_phase10_instrumentation.py` — fakes for Region's mouse
+  + finder backends; assert each instrumented method emits the
+  expected `(category, verb, target)` tuple.
+* `tests/test_phase10_console_sink.py` — drives a fake script through
+  `_DefaultRunnerHost` with the logger enabled; assert the
+  `ConsoleBuffer` ends up with one entry per action, in order.
+
 ## Out of scope (for now)
 
 * MCP module — Java-specific, superseded by Python MCP SDKs
