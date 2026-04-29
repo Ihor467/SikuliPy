@@ -455,10 +455,27 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         picker = state.device_picker
         if picker is None:
             return
+        # Pre-fill the input with the most recent Wi-Fi address so the
+        # user can re-pair after a reboot/disconnect with one Enter.
+        # Selected target wins (it's almost always what the user wants
+        # back); otherwise fall back to the first non-USB serial.
+        default = ""
+        selected = next(
+            (e for e in picker.entries if e.key == picker.selected_key),
+            None,
+        )
+        if selected and selected.serial and ":" in selected.serial:
+            default = selected.serial
+        else:
+            default = next(
+                (e.serial for e in picker.entries if e.serial and ":" in e.serial),
+                "",
+            )
         with _ide_hidden(page):
             addr = _ask_native_input(
                 "host[:port] of the Wi-Fi device:",
                 title="Pair Wi-Fi device",
+                default=default,
             )
         if not addr:
             return
