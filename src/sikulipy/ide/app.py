@@ -363,14 +363,35 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
 
     def _record_click(_e):
         if state.recorder is None:
-            state.recorder = RecorderSession()
-            state.device_picker = DevicePicker(session=state.recorder)
-            # Best-effort initial refresh so the dropdown lists USB
-            # devices that were already plugged in when the recorder
-            # opened. Errors (no adb, no pure-python-adb) are absorbed
-            # by ``DevicePicker.refresh`` and surfaced as last_error.
-            state.device_picker.refresh()
-            state.status.set_message("Recording — use buttons under the editor")
+            session = RecorderSession()
+            picker = DevicePicker(session=session)
+            # Best-effort initial refresh so we can decide whether a
+            # target prompt is needed. Errors (no adb, no
+            # pure-python-adb) are absorbed by ``DevicePicker.refresh``
+            # and surfaced via last_error.
+            picker.refresh()
+            # Only ask the user when there's a real choice. Desktop
+            # alone (no Android attached) → start silently on desktop.
+            if len(picker.entries) > 1:
+                with _ide_hidden(page):
+                    chosen = _pick_target_native(
+                        picker.entries,
+                        selected_key=picker.selected_key,
+                    )
+                if chosen is None:
+                    state.status.set_message("Recording cancelled")
+                    refresh()
+                    return
+                try:
+                    picker.select(chosen)
+                except Exception as exc:
+                    state.status.set_message(f"Device select failed: {exc}")
+                    refresh()
+                    return
+            state.recorder = session
+            state.device_picker = picker
+            target = "desktop" if picker.selected_key == DESKTOP_ENTRY_KEY else picker.selected_key
+            state.status.set_message(f"Recording on {target} — use buttons under the editor")
         else:
             state.recorder.discard()
             state.recorder = None
@@ -407,6 +428,57 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
     recording = state.recorder is not None
     record_color = ft.Colors.RED if recording else ft.Colors.GREY
 
+    # Mid-session device controls. Hidden until Record is on, so the
+    # toolbar stays compact for users who never touch Android.
+    def _devices_switch(_e: ft.ControlEvent) -> None:
+        picker = state.device_picker
+        if picker is None:
+            return
+        picker.refresh()
+        with _ide_hidden(page):
+            chosen = _pick_target_native(
+                picker.entries,
+                selected_key=picker.selected_key,
+                title="Switch recording target",
+            )
+        if chosen is None:
+            return
+        try:
+            picker.select(chosen)
+            target = "desktop" if chosen == DESKTOP_ENTRY_KEY else chosen
+            state.status.set_message(f"Recorder target: {target}")
+        except Exception as exc:
+            state.status.set_message(f"Device select failed: {exc}")
+        refresh()
+
+    def _devices_pair(_e: ft.ControlEvent) -> None:
+        picker = state.device_picker
+        if picker is None:
+            return
+        with _ide_hidden(page):
+            addr = _ask_native_input(
+                "host[:port] of the Wi-Fi device:",
+                title="Pair Wi-Fi device",
+            )
+        if not addr:
+            return
+        try:
+            entry = picker.connect_address(addr)
+            state.status.set_message(f"Connected: {entry.serial}")
+        except Exception as exc:
+            state.status.set_message(f"Pair failed: {exc}")
+        refresh()
+
+    devices_menu = ft.PopupMenuButton(
+        icon=ft.Icons.PHONE_ANDROID,
+        tooltip="Recording target / Wi-Fi pairing",
+        items=[
+            ft.PopupMenuItem(text="Switch target…", on_click=_devices_switch),
+            ft.PopupMenuItem(text="Pair Wi-Fi device…", on_click=_devices_pair),
+        ],
+        visible=recording,
+    )
+
     return ft.Row(
         controls=[
             ft.ElevatedButton(
@@ -428,6 +500,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
                 icon_color=record_color,
                 on_click=_record_click,
             ),
+            devices_menu,
             ft.ElevatedButton("New",     icon=ft.Icons.ADD,        on_click=_wrap(state.toolbar.new)),
             ft.ElevatedButton("Open",    icon=ft.Icons.FOLDER_OPEN, on_click=_open_folder_click),
             ft.ElevatedButton("Save",    icon=ft.Icons.SAVE,       on_click=_wrap(_save_handler(state))),
@@ -480,6 +553,81 @@ def _ask_native_input(prompt: str, title: str = "SikuliPy", default: str = "") -
     if value is None:
         return None
     return value.strip() or None
+
+
+def _pick_target_native(
+    entries: "list",
+    *,
+    selected_key: str,
+    title: str = "Select recording target",
+) -> str | None:
+    """Show a native radiolist (kdialog → zenity → tk) of recorder targets.
+
+    ``entries`` is a list of ``DeviceEntry``. Returns the chosen key, or
+    ``None`` if the user cancels the dialog. Falls back to a plain Tk
+    Combobox on hosts without kdialog/zenity. Bypassing Flet here keeps
+    the dialog on top of the IDE/recording surface and avoids the
+    AlertDialog API churn between Flet versions.
+    """
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+    if kdialog := shutil.which("kdialog"):
+        args = [kdialog, "--title", title, "--radiolist", "Choose where to record:"]
+        for entry in entries:
+            args.extend([entry.key, entry.label, "on" if entry.key == selected_key else "off"])
+        r = subprocess.run(args, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    if zenity := shutil.which("zenity"):
+        args = [
+            zenity, "--list", "--radiolist", f"--title={title}",
+            "--text=Choose where to record:",
+            "--column=", "--column=Key", "--column=Target",
+            "--hide-column=2", "--print-column=2",
+        ]
+        for entry in entries:
+            args.extend([
+                "TRUE" if entry.key == selected_key else "FALSE",
+                entry.key,
+                entry.label,
+            ])
+        r = subprocess.run(args, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+    import tkinter
+    from tkinter import ttk
+    root = tkinter.Tk()
+    root.title(title)
+    try:
+        root.attributes("-topmost", True)
+    except tkinter.TclError:
+        pass
+    label_to_key = {entry.label: entry.key for entry in entries}
+    selected_label = next(
+        (e.label for e in entries if e.key == selected_key),
+        entries[0].label if entries else "",
+    )
+    var = tkinter.StringVar(value=selected_label)
+    chosen: dict[str, str | None] = {"key": None}
+    ttk.Label(root, text="Choose where to record:").pack(padx=12, pady=(12, 4))
+    combo = ttk.Combobox(root, textvariable=var, values=list(label_to_key), state="readonly")
+    combo.pack(padx=12, pady=4)
+    btns = ttk.Frame(root)
+    btns.pack(padx=12, pady=12)
+    def _ok() -> None:
+        chosen["key"] = label_to_key.get(var.get())
+        root.destroy()
+    def _cancel() -> None:
+        chosen["key"] = None
+        root.destroy()
+    ttk.Button(btns, text="OK", command=_ok).pack(side="left", padx=4)
+    ttk.Button(btns, text="Cancel", command=_cancel).pack(side="left", padx=4)
+    root.protocol("WM_DELETE_WINDOW", _cancel)
+    root.mainloop()
+    return chosen["key"]
 
 
 def _pick_save_file(initial_dir: str, suggested_name: str = "untitled.py") -> str | None:
@@ -1033,99 +1181,6 @@ def _prompt_payload(page: ft.Page, prompt: str, on_ok) -> None:
     on_ok(value or "")
 
 
-def _build_device_row(state: _IDEState, refresh: callable) -> ft.Row | None:
-    """Top row of the recorder bar: target-device dropdown + Refresh + IP.
-
-    Lets the user record against either the desktop or an attached
-    Android device. All ADB calls go through ``state.device_picker``,
-    which absorbs missing-deps / connection errors so the row never
-    crashes the recorder. Returns ``None`` when the recorder isn't
-    active (defensive — caller already checks)."""
-    picker = state.device_picker
-    if picker is None:
-        return None
-
-    options = [
-        ft.dropdown.Option(key=entry.key, text=entry.label)
-        for entry in picker.entries
-    ]
-    dropdown = ft.Dropdown(
-        value=picker.selected_key,
-        options=options,
-        dense=True,
-        width=240,
-    )
-
-    def _on_change(_e: ft.ControlEvent) -> None:
-        try:
-            picker.select(dropdown.value or DESKTOP_ENTRY_KEY)
-            target = "desktop" if dropdown.value == DESKTOP_ENTRY_KEY else dropdown.value
-            state.status.set_message(f"Recorder target: {target}")
-        except Exception as exc:
-            state.status.set_message(f"Device select failed: {exc}")
-        refresh()
-
-    dropdown.on_change = _on_change
-
-    def _on_refresh(_e: ft.ControlEvent) -> None:
-        picker.refresh()
-        if picker.last_error:
-            state.status.set_message(f"ADB: {picker.last_error}")
-        else:
-            n = max(0, len(picker.entries) - 1)  # exclude desktop
-            state.status.set_message(f"ADB devices: {n}")
-        refresh()
-
-    address_field = ft.TextField(
-        hint_text="host[:port]",
-        dense=True,
-        width=180,
-    )
-
-    def _on_connect(_e: ft.ControlEvent) -> None:
-        addr = (address_field.value or "").strip()
-        if not addr:
-            state.status.set_message("Enter host[:port] to connect over WiFi")
-            return
-        try:
-            entry = picker.connect_address(addr)
-            state.status.set_message(f"Connected: {entry.serial}")
-            address_field.value = ""
-        except Exception as exc:
-            state.status.set_message(f"Connect failed: {exc}")
-        refresh()
-
-    # Green WIFI when an Android device is the active surface; grey
-    # while the recorder is still pointed at the desktop. Single-glance
-    # indicator that the next captured action will land on the tablet.
-    connected = picker.selected_key != DESKTOP_ENTRY_KEY
-    wifi_color = ft.Colors.GREEN_700 if connected else ft.Colors.GREY_500
-
-    return ft.Row(
-        controls=[
-            ft.Text("Target:", size=12),
-            dropdown,
-            ft.IconButton(
-                icon=ft.Icons.REFRESH,
-                tooltip="Refresh ADB devices",
-                on_click=_on_refresh,
-            ),
-            ft.Container(width=12),
-            address_field,
-            ft.ElevatedButton(
-                "Pair Wi-Fi device",
-                icon=ft.Icons.WIFI,
-                icon_color=wifi_color,
-                tooltip="Run adb connect host[:port] to add a new wireless device",
-                on_click=_on_connect,
-            ),
-        ],
-        spacing=6,
-        wrap=True,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-    )
-
-
 def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Container | None:
     if state.recorder is None:
         return None
@@ -1395,16 +1450,9 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         spacing=6,
     )
 
-    device_row = _build_device_row(state, refresh)
-
-    column_controls: list[ft.Control] = []
-    if device_row is not None:
-        column_controls.append(device_row)
-    column_controls.extend([tabs, footer])
-
     return ft.Container(
         content=ft.Column(
-            controls=column_controls,
+            controls=[tabs, footer],
             spacing=4,
             expand=True,
         ),
