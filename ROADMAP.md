@@ -278,12 +278,11 @@ output).
   formats records as `[12:34:56.789] click Pattern("ok.png") @
   Region(…) in 42 ms` and writes them via `console.write("stdout",
   …)` so they interleave with the script's own `print()` output.
-* **Level toggle.** Status-bar dropdown next to the lint chip
-  (`off / action / verbose`); persisted via Flet's
-  `client_storage`. `verbose` adds find-attempt counts and capture
-  bytes; `action` only emits the start/end pair. `off` short-circuits
-  the decorator with one `if level == OFF: return fn(...)` branch so
-  the perf cost on benchmark loops is one attribute lookup.
+* **Level toggle.** The decorator's `if level < ACTION: return fn(...)`
+  short-circuit is in place, so the perf cost at OFF is one attribute
+  lookup. The runner sets the level to `action` for the duration of a
+  script and back to `off` on exit. A user-facing status-bar dropdown
+  (off / action / verbose) is deferred to [`BACKLOG.md`](BACKLOG.md).
 * **Console capacity.** `ConsoleBuffer` is a 2000-entry ring buffer
   (`ide/console.py`); a tight find-loop can saturate it. Two mitigations:
   bump the cap to 10 000 when level ≥ action, and coalesce identical
