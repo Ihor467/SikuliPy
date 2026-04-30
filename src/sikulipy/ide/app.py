@@ -88,6 +88,10 @@ class _IDEState:
         # Shift+Tab without stealing keys from other inputs.
         self.editor_field: "ft.TextField | None" = None
         self.editor_focused: bool = False
+        # X11 window IDs iconified at Run-click time so the script has
+        # an unobstructed view of whatever's underneath. Restored from
+        # the runner-finished callback. Empty when the IDE is up.
+        self.hidden_run_window_ids: list = []
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,57 @@ def _ensure_imports_for(state: "_IDEState", code: str) -> None:
     state.document.insert(block, at=insert_at)
     if state.document.cursor >= insert_at:
         state.document.cursor += len(block)
+
+
+def _open_url_external(url: str) -> tuple[bool, str]:
+    """Spawn the platform URL handler with cv2's Qt env vars stripped.
+
+    Returns ``(ok, detail)``. ``detail`` is a short error string when
+    we couldn't find a launcher or the spawn itself raised — used by
+    callers to put something useful in the status bar.
+
+    Why bother instead of ``webbrowser.open``: on Linux ``webbrowser``
+    invokes xdg-open via subprocess but inherits the parent's env,
+    including the ``QT_QPA_PLATFORM_PLUGIN_PATH`` cv2 sets on import.
+    xdg-open shells out to a Qt-based handler (kde-open / Falkon / etc.),
+    which then loads xcb from cv2's plugin dir, fails, and exits 0. The
+    user sees nothing. Stripping those keys is the documented fix.
+    """
+    import sys
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    if sys.platform.startswith("linux"):
+        candidates = ("xdg-open", "gio", "kde-open")
+    elif sys.platform == "darwin":
+        candidates = ("open",)
+    elif sys.platform.startswith("win"):
+        candidates = ("start",)
+    else:
+        candidates = ("xdg-open",)
+
+    env = native_dialog_env()
+    last_err = ""
+    for cmd in candidates:
+        path = shutil.which(cmd)
+        if path is None:
+            continue
+        try:
+            args = [path, "open", url] if cmd == "gio" else [path, url]
+            # start=detached; stdin/stdout closed so the launcher doesn't
+            # keep our pipes alive after the IDE exits.
+            subprocess.Popen(  # noqa: S603 — args are trusted, hard-coded list
+                args,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True, ""
+        except Exception as exc:
+            last_err = f"{cmd}: {exc}"
+            continue
+    return False, last_err or "no URL launcher found"
 
 
 def _x11_iconify_by_title(title: str) -> list:
@@ -321,6 +376,43 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
             refresh()
         return handler
 
+    def _run_click(_e):
+        # Sikuli scripts drive the *real* desktop, so the IDE has to
+        # step out of the way before the script starts clicking — same
+        # pattern the recorder/capture flows already use. We hide
+        # *before* dispatching to the runner so the script's first
+        # action has an unobstructed framebuffer; window IDs are
+        # restored from on_finished. _ide_hidden's context-manager
+        # form doesn't fit here because the runner returns
+        # immediately on a background thread.
+        try:
+            if state.toolbar.document.path is None:
+                state.status.set_message("Save the buffer before running")
+                refresh()
+                return
+            # Best-effort hide. If Xlib is missing or the WM ignores
+            # the iconify request, we still run the script — losing
+            # the visual is annoying but not fatal.
+            state.hidden_run_window_ids = _x11_iconify_by_title("SikuliPy")
+            try:
+                page.window.minimized = True
+            except Exception:
+                pass
+            page.update()
+            time.sleep(_HIDE_SETTLE_SECONDS)
+            state.toolbar.run()
+        except Exception as exc:
+            # Run failed before the runner thread started — restore
+            # the IDE so the user can read the error in the status bar.
+            _x11_map_by_id(state.hidden_run_window_ids)
+            state.hidden_run_window_ids = []
+            try:
+                page.window.minimized = False
+            except Exception:
+                pass
+            state.status.set_message(f"Run failed: {exc}")
+        refresh()
+
     def _open_folder_click(_e):
         try:
             folder = _pick_directory(str(state.root))
@@ -400,26 +492,24 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
         refresh()
 
     def _docs_click(_e):
-        # Flet desktop's ``page.launch_url`` silently no-ops on Linux
-        # because the embedded Flutter view has no url_launcher plugin
-        # registered. Fall back to Python's ``webbrowser`` (which spawns
-        # xdg-open / open / start), and only if that fails do we try
-        # the Flet path as a last resort.
-        import webbrowser
-
-        opened = False
-        try:
-            opened = webbrowser.open(_DOCS_URL, new=2)
-        except Exception as exc:
-            state.status.set_message(f"webbrowser failed: {exc}")
-        if not opened:
+        # webbrowser.open returns True on Linux as long as it could
+        # *spawn* xdg-open — even when the spawn inherits cv2's
+        # QT_QPA_* env vars and xdg-open itself crashes silently. We've
+        # been bitten by exactly that elsewhere (see subprocess_env.py).
+        # Run xdg-open / open / start ourselves with the cleaned env so
+        # the browser actually launches.
+        ok, detail = _open_url_external(_DOCS_URL)
+        if ok:
+            state.status.set_message(f"Opened {_DOCS_URL}")
+        else:
+            # Last resort: hand off to Flet's launch_url. Linux desktop
+            # builds usually no-op here, but it's the right call on web
+            # and macOS/Windows builds where url_launcher works.
             try:
                 page.launch_url(_DOCS_URL)
-                opened = True
+                state.status.set_message(f"Opened {_DOCS_URL}")
             except Exception as exc:
-                state.status.set_message(f"Open docs failed: {exc}")
-        if opened:
-            state.status.set_message(f"Opened {_DOCS_URL}")
+                state.status.set_message(f"Open docs failed: {detail or exc}")
         refresh()
 
     running = state.toolbar.is_running()
@@ -502,7 +592,7 @@ def _build_toolbar(state: _IDEState, page: ft.Page, refresh: callable) -> ft.Row
                 "Run",
                 icon=ft.Icons.PLAY_ARROW,
                 icon_color=run_color,
-                on_click=_wrap(state.toolbar.run),
+                on_click=_run_click,
             ),
             ft.ElevatedButton(
                 "Stop",
@@ -1732,6 +1822,17 @@ def ide_main(page: ft.Page) -> None:
             state.status.set_message(f"Finished {name} (exit 0)")
         else:
             state.status.set_message(f"Finished {name} with errors (exit {code})")
+        # Restore any windows we iconified for the run. on_finished is
+        # called from the runner thread; X11 calls inside _x11_map_by_id
+        # are fine off the main thread, but Flet's window.minimized must
+        # be touched only after page.update — we let refresh() handle it.
+        if state.hidden_run_window_ids:
+            _x11_map_by_id(state.hidden_run_window_ids)
+            state.hidden_run_window_ids = []
+        try:
+            page.window.minimized = False
+        except Exception:
+            pass
         refresh()
 
     state.on_runner_finished = _on_finished
