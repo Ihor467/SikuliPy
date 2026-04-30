@@ -1619,13 +1619,20 @@ def _build_console(
         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
     )
+    # Header is a sibling of the scrollable Column, not a child, so the
+    # Copy button stays pinned at the top of the pane while the log
+    # underneath scrolls. Putting it inside a scroll=AUTO Column made
+    # it slide out of view as the buffer grew.
+    body = ft.Column(
+        controls=[ft.Text(text, selectable=True, font_family="monospace", size=12)],
+        scroll=ft.ScrollMode.AUTO,
+        expand=True,
+    )
     return ft.Container(
         content=ft.Column(
-            controls=[
-                header,
-                ft.Text(text, selectable=True, font_family="monospace", size=12),
-            ],
-            scroll=ft.ScrollMode.AUTO,
+            controls=[header, body],
+            spacing=4,
+            expand=True,
         ),
         padding=10,
         bgcolor=ft.Colors.BLACK12,
