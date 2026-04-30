@@ -14,6 +14,36 @@ from typing import TYPE_CHECKING, Any
 
 from sikulipy.core.element import Element
 from sikulipy.script.exceptions import FindFailed
+from sikulipy.util.action_log import logged_action
+
+
+def _region_surface(self_, *_a, **_k) -> str:
+    return getattr(self_, "_surface_name", None) or "desktop"
+
+
+def _fmt_target(self_, *args, **_k) -> str:
+    if not args:
+        return ""
+    try:
+        return repr(args[0])
+    except Exception as exc:
+        return f"<repr failed: {exc}>"
+
+
+def _fmt_wait(self_, *args, **kwargs) -> str:
+    target = repr(args[0]) if args else ""
+    timeout = kwargs.get("timeout", args[1] if len(args) > 1 else None)
+    return f"{target} timeout={timeout}" if timeout is not None else target
+
+
+def _fmt_drag(self_, *args, **_k) -> str:
+    if len(args) >= 2:
+        return f"{args[0]!r} → {args[1]!r}"
+    return _fmt_target(self_, *args)
+
+
+def _fmt_type(self_, *args, **_k) -> str:
+    return repr(args[0]) if args else ""
 
 if TYPE_CHECKING:
     from sikulipy.core.image import Image
@@ -156,12 +186,14 @@ class Region(Element):
         self._frozen_bitmap = (bitmap, int(origin_x), int(origin_y))
 
     # ---- Finding (Phase 1) -------------------------------------------
+    @logged_action("region", "find", target=_fmt_target, surface=_region_surface)
     def find(self, target: PatternLike) -> "Match":
         m = self._find_once(target)
         if m is None:
             raise FindFailed(f"Pattern not found in region {self!r}")
         return m
 
+    @logged_action("region", "find_all", target=_fmt_target, surface=_region_surface)
     def find_all(self, target: PatternLike) -> list["Match"]:
         from sikulipy.core.finder import Finder
 
@@ -170,15 +202,18 @@ class Region(Element):
         finder = Finder(haystack, region=self)
         return finder.find_all(needle, similarity=similarity)
 
+    @logged_action("region", "exists", target=_fmt_wait, surface=_region_surface)
     def exists(self, target: PatternLike, timeout: float = 0.0) -> "Match | None":
         return self._wait_for(target, timeout, want_match=True)
 
+    @logged_action("region", "wait", target=_fmt_wait, surface=_region_surface)
     def wait(self, target: PatternLike, timeout: float = 3.0) -> "Match":
         m = self._wait_for(target, timeout, want_match=True)
         if m is None:
             raise FindFailed(f"wait({target!r}) timed out after {timeout}s")
         return m
 
+    @logged_action("region", "wait_vanish", target=_fmt_wait, surface=_region_surface)
     def wait_vanish(self, target: PatternLike, timeout: float = 3.0) -> bool:
         return self._wait_for(target, timeout, want_match=False) is None or True  # type: ignore[return-value]
 
@@ -231,6 +266,7 @@ class Region(Element):
         m = self.find(target)
         return m.center(), 0.0
 
+    @logged_action("region", "click", target=_fmt_target, surface=_region_surface)
     def click(self, target: PatternLike | None = None) -> int:
         from sikulipy.core.mouse import Mouse
 
@@ -240,6 +276,7 @@ class Region(Element):
             _sleep(post)
         return 1
 
+    @logged_action("region", "double_click", target=_fmt_target, surface=_region_surface)
     def double_click(self, target: PatternLike | None = None) -> int:
         from sikulipy.core.mouse import Mouse
 
@@ -249,6 +286,7 @@ class Region(Element):
             _sleep(post)
         return 1
 
+    @logged_action("region", "right_click", target=_fmt_target, surface=_region_surface)
     def right_click(self, target: PatternLike | None = None) -> int:
         from sikulipy.core.mouse import Mouse
 
@@ -258,6 +296,7 @@ class Region(Element):
             _sleep(post)
         return 1
 
+    @logged_action("region", "hover", target=_fmt_target, surface=_region_surface)
     def hover(self, target: PatternLike | None = None) -> int:
         from sikulipy.core.mouse import Mouse
 
@@ -265,6 +304,7 @@ class Region(Element):
         Mouse.move(loc)
         return 1
 
+    @logged_action("region", "drag_drop", target=_fmt_drag, surface=_region_surface)
     def drag_drop(self, src: PatternLike, dst: PatternLike) -> int:
         from sikulipy.core.mouse import Mouse
 
@@ -273,6 +313,7 @@ class Region(Element):
         Mouse.drag_drop(src_loc, dst_loc)
         return 1
 
+    @logged_action("region", "type", target=_fmt_type, surface=_region_surface)
     def type(self, text: str, modifiers: int = 0) -> int:
         from sikulipy.core.keyboard import Key
 
@@ -289,6 +330,7 @@ class Region(Element):
         return len(text)
 
     # ---- OCR (Phase 3) -----------------------------------------------
+    @logged_action("region", "text", target="", surface=_region_surface)
     def text(self) -> str:
         """OCR this region and return the recognised text."""
         from sikulipy.ocr import OCR
@@ -303,6 +345,7 @@ class Region(Element):
         # Translate from region-local coordinates to absolute screen coords.
         return [w.offset(self.x, self.y) for w in raw]
 
+    @logged_action("region", "find_text", target=_fmt_target, surface=_region_surface)
     def find_text(self, needle: str) -> "Match":
         from sikulipy.core.match import Match
         from sikulipy.ocr import OCR
@@ -315,6 +358,7 @@ class Region(Element):
             x=self.x + w.x, y=self.y + w.y, w=w.w, h=w.h, score=float(w.confidence)
         )
 
+    @logged_action("region", "find_all_text", target=_fmt_target, surface=_region_surface)
     def find_all_text(self, needle: str) -> list["Match"]:
         from sikulipy.core.match import Match
         from sikulipy.ocr import OCR

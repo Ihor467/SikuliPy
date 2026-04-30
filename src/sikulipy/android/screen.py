@@ -13,6 +13,27 @@ from typing import TYPE_CHECKING, Any
 
 from sikulipy.android.client import ADBClient, ADBDevice
 from sikulipy.core.region import Region, _resolve_pattern
+from sikulipy.util.action_log import logged_action
+
+
+def _adb_surface(self_, *_a, **_k) -> str:
+    serial = getattr(getattr(self_, "device", None), "serial", None)
+    return f"adb:{serial}" if serial else "adb"
+
+
+def _fmt_target(_self, *args, **_k) -> str:
+    if not args:
+        return ""
+    try:
+        return repr(args[0])
+    except Exception as exc:
+        return f"<repr failed: {exc}>"
+
+
+def _fmt_drag(_self, *args, **_k) -> str:
+    if len(args) >= 2:
+        return f"{args[0]!r} → {args[1]!r}"
+    return _fmt_target(_self, *args)
 
 if TYPE_CHECKING:
     from sikulipy.core.location import Location
@@ -37,6 +58,7 @@ class ADBScreen(Region):
 
     def __init__(self, device: ADBDevice) -> None:
         self.device: ADBDevice = device
+        self._surface_name = f"adb:{device.serial}" if getattr(device, "serial", None) else "adb"
         w, h = device.size()
         super().__init__(x=0, y=0, w=w, h=h)
 
@@ -80,11 +102,13 @@ class ADBScreen(Region):
         m = self.find(target)
         return m.center()
 
+    @logged_action("android", "click", target=_fmt_target, surface=_adb_surface)
     def click(self, target: PatternLike | None = None) -> int:
         loc = self._loc_for(target)
         self.device.tap(loc.x, loc.y)
         return 1
 
+    @logged_action("android", "double_click", target=_fmt_target, surface=_adb_surface)
     def double_click(self, target: PatternLike | None = None) -> int:
         loc = self._loc_for(target)
         # No native double-tap; two quick taps is the standard ADB idiom.
@@ -92,16 +116,19 @@ class ADBScreen(Region):
         self.device.tap(loc.x, loc.y)
         return 1
 
+    @logged_action("android", "right_click", target=_fmt_target, surface=_adb_surface)
     def right_click(self, target: PatternLike | None = None) -> int:
         # Android has no right-click; treat as long press.
         loc = self._loc_for(target)
         self.device.long_press(loc.x, loc.y)
         return 1
 
+    @logged_action("android", "hover", target=_fmt_target, surface=_adb_surface)
     def hover(self, target: PatternLike | None = None) -> int:
         # ADB has no hover concept.
         return 0
 
+    @logged_action("android", "drag_drop", target=_fmt_drag, surface=_adb_surface)
     def drag_drop(
         self,
         src: PatternLike,
@@ -114,6 +141,7 @@ class ADBScreen(Region):
         self.device.swipe(src_loc.x, src_loc.y, dst_loc.x, dst_loc.y, duration_ms)
         return 1
 
+    @logged_action("android", "swipe", target=_fmt_drag, surface=_adb_surface)
     def swipe(
         self,
         src: PatternLike,
@@ -123,6 +151,7 @@ class ADBScreen(Region):
     ) -> int:
         return self.drag_drop(src, dst, duration_ms=duration_ms)
 
+    @logged_action("android", "type", target=_fmt_target, surface=_adb_surface)
     def type(self, text: str, modifiers: int = 0) -> int:  # noqa: ARG002 - no modifiers on ADB
         self.device.input_text(text)
         return len(text)
@@ -132,6 +161,7 @@ class ADBScreen(Region):
         return self.type(text)
 
     # ---- Utility ----------------------------------------------------
+    @logged_action("android", "find_text_coordinates", target=_fmt_target, surface=_adb_surface)
     def find_text_coordinates(self, needle: str) -> tuple[int, int, int, int] | None:
         """Parity with OculiX Java: return (x, y, w, h) for the first OCR match."""
         needle_bgr = self._capture_bgr()

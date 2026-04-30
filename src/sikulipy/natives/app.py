@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from sikulipy.natives._backend import get_backend
 from sikulipy.natives.types import WindowInfo
+from sikulipy.util.action_log import logged_action
 
 if TYPE_CHECKING:  # avoid the numpy/opencv import on module load
     from sikulipy.core.region import Region
@@ -34,6 +35,7 @@ class App:
 
     # ---- Construction ---------------------------------------------
     @classmethod
+    @logged_action("app", "open", target=lambda _cls, *a, **_k: repr(a[0]) if a else "")
     def open(cls, name: str, *, args: list[str] | None = None) -> "App":
         pid = get_backend().open(name, args=args)
         return cls(name=name, pid=pid)
@@ -53,6 +55,7 @@ class App:
         return cls(name=info.title, pid=info.pid)
 
     # ---- Process control ------------------------------------------
+    @logged_action("app", "focus", target=lambda self_, *_a, **_k: repr(self_.name))
     def focus(self, *, title: str | None = None) -> bool:
         if self.pid is None:
             candidate = get_backend().find_by_title(title or self.name)
@@ -61,6 +64,7 @@ class App:
             self.pid = candidate.pid
         return get_backend().focus(self.pid, title=title)
 
+    @logged_action("app", "close", target=lambda self_, *_a, **_k: repr(self_.name))
     def close(self) -> bool:
         if self.pid is None:
             return False
