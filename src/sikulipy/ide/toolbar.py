@@ -103,6 +103,13 @@ class DefaultRunnerHost:
                     with self._action_log_session(None):
                         _body()
             finally:
+                # Drop the thread reference *before* calling
+                # on_finished so anyone the callback wakes up sees
+                # is_running() == False and can repaint the toolbar
+                # accordingly (Run goes green, Stop goes grey). If we
+                # cleared this after the callback, the UI would still
+                # think a script was live until the next refresh.
+                self._thread = None
                 if self.on_finished is not None:
                     try:
                         self.on_finished(self._exit_code if self._exit_code is not None else 0)

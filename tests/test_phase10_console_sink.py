@@ -165,6 +165,27 @@ def test_runner_can_be_disabled_via_action_log_level_none(tmp_path: Path) -> Non
     assert logger.level == Level.VERBOSE
 
 
+def test_runner_clears_thread_before_on_finished(tmp_path: Path) -> None:
+    """is_running() must report False from inside on_finished.
+
+    The toolbar repaints in this callback (Run → green, Stop → grey).
+    If _thread were still set when on_finished fired, the rebuild
+    would think a script was still live and leave the icons inverted
+    until the next refresh.
+    """
+    observed: list[bool] = []
+
+    script = _write_script(tmp_path, "print('hi')\n")
+    host = DefaultRunnerHost(
+        console=ConsoleBuffer(),
+        on_finished=lambda _code: observed.append(host.is_running()),
+    )
+    host.run(script)
+    _wait_for_runner(host)
+
+    assert observed == [False]
+
+
 def test_runner_bumps_console_cap_during_run(tmp_path: Path) -> None:
     """While a script runs at action+, the cap should be 10 000."""
     observed: list[int] = []
