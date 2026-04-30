@@ -1483,12 +1483,56 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
     )
 
 
-def _build_console(state: _IDEState) -> ft.Container:
+def _build_console(
+    state: _IDEState, refresh_statusbar: "Callable[[], None] | None" = None
+) -> ft.Container:
     text = state.console.text() or f"SikuliPy {__version__} — ready."
+
+    def _set_status(msg: str) -> None:
+        state.status.set_message(msg)
+        if refresh_statusbar is not None:
+            try:
+                refresh_statusbar()
+            except (AssertionError, AttributeError):
+                pass
+
+    def _copy_console(e: ft.ControlEvent) -> None:
+        # Always copy the live buffer, not the snapshot baked into the
+        # rendered Text — the buffer keeps growing while this view is up.
+        # Flet 0.84's Page.set_clipboard is gone (Clipboard().set is now
+        # async); pyperclip is the project's established sync route
+        # (also used by Region.paste) and works without spinning up
+        # Flet's service plumbing.
+        from sikulipy.core.env import Env
+
+        payload = state.console.text()
+        if not payload:
+            _set_status("Console is empty")
+            return
+        try:
+            Env.set_clipboard(payload)
+        except Exception as exc:
+            _set_status(f"Copy failed: {exc}")
+            return
+        _set_status(f"Copied {len(payload)} chars from Console")
+
+    header = ft.Row(
+        controls=[
+            ft.Text("Console", weight=ft.FontWeight.BOLD),
+            ft.IconButton(
+                icon=ft.Icons.CONTENT_COPY,
+                tooltip="Copy console output to clipboard",
+                icon_size=16,
+                on_click=_copy_console,
+            ),
+        ],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
     return ft.Container(
         content=ft.Column(
             controls=[
-                ft.Text("Console", weight=ft.FontWeight.BOLD),
+                header,
                 ft.Text(text, selectable=True, font_family="monospace", size=12),
             ],
             scroll=ft.ScrollMode.AUTO,
@@ -1635,7 +1679,7 @@ def ide_main(page: ft.Page) -> None:
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
-        console_pane = _build_console(state)
+        console_pane = _build_console(state, refresh_statusbar)
         recorder_bar = _build_recorder_bar(state, page, refresh)
         if recorder_bar is None:
             bottom_pane: ft.Control = console_pane
