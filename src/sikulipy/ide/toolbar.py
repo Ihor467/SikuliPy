@@ -11,15 +11,30 @@ process.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
 from sikulipy.ide.capture import CaptureSession
-from sikulipy.ide.console import ConsoleBuffer, ConsoleRedirect
+from sikulipy.ide.console import ConsoleBuffer, ConsoleEntry, ConsoleRedirect
 from sikulipy.ide.editor import EditorDocument
+from sikulipy.util.action_log import (
+    Coalescer,
+    Level,
+    format_record,
+    get_action_logger,
+)
+
+
+# Bump the Console ring buffer while the logger is active. A tight
+# wait()/exists() loop can fire dozens of records per second; the
+# default 2000-entry cap fills in seconds. Restored on script exit so
+# memory doesn't grow without bound across sessions.
+_RUNNING_CONSOLE_CAP = 10_000
 
 
 class RunnerHost(Protocol):
@@ -47,6 +62,10 @@ class DefaultRunnerHost:
 
     console: ConsoleBuffer | None = None
     on_finished: Callable[[int], None] | None = None
+    # Action-log level applied for the duration of each run. None means
+    # "leave the logger alone" — useful for tests that don't want the
+    # runner to clobber a level they set up.
+    action_log_level: Level | None = Level.ACTION
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _exit_code: int | None = field(default=None, init=False, repr=False)
 
@@ -78,9 +97,11 @@ class DefaultRunnerHost:
             try:
                 if self.console is not None:
                     with ConsoleRedirect(self.console, tee=True):
-                        _body()
+                        with self._action_log_session(self.console):
+                            _body()
                 else:
-                    _body()
+                    with self._action_log_session(None):
+                        _body()
             finally:
                 if self.on_finished is not None:
                     try:
@@ -100,6 +121,62 @@ class DefaultRunnerHost:
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @contextlib.contextmanager
+    def _action_log_session(self, console: ConsoleBuffer | None):
+        """Bind the global ActionLogger to ``console`` for one script run.
+
+        Sets the level (if requested), bumps the console capacity to
+        absorb log volume from tight loops, attaches a Coalescer-backed
+        sink that writes ``format_record`` lines to the console, and
+        restores all three on exit. Safe to nest with no console — then
+        only the level is touched.
+        """
+        logger = get_action_logger()
+        prior_level = logger.level
+        if self.action_log_level is not None:
+            logger.level = self.action_log_level
+
+        prior_cap: int | None = None
+        prior_entries: deque[ConsoleEntry] | None = None
+        unsubscribe: Callable[[], None] | None = None
+        coalescer: Coalescer | None = None
+
+        if console is not None and logger.level >= Level.ACTION:
+            # Resize the ring buffer in place so existing subscribers
+            # (the Flet view) keep their reference. deque(maxlen=N) is
+            # the cheapest way to grow it; old entries carry over.
+            prior_cap = console.max_entries
+            if prior_cap < _RUNNING_CONSOLE_CAP:
+                prior_entries = console._entries
+                console.max_entries = _RUNNING_CONSOLE_CAP
+                console._entries = deque(prior_entries, maxlen=_RUNNING_CONSOLE_CAP)
+
+            coalescer = Coalescer()
+
+            def _sink(record) -> None:  # noqa: ANN001 — ActionRecord
+                lines = coalescer.feed(record)
+                for line in lines:
+                    console.write("stdout", line + "\n")
+
+            unsubscribe = logger.add_sink(_sink)
+
+        try:
+            yield
+        finally:
+            if unsubscribe is not None:
+                # Drain the coalescer so the last buffered run lands in
+                # the console rather than getting silently dropped.
+                if coalescer is not None and console is not None:
+                    for line in coalescer.flush():
+                        console.write("stdout", line + "\n")
+                unsubscribe()
+            if prior_cap is not None and console is not None:
+                console.max_entries = prior_cap
+                # Don't rebuild _entries — shrinking would discard log
+                # output the user can still scroll back to. The next
+                # write() will trim naturally as new entries arrive.
+            logger.level = prior_level
 
 
 @dataclass
