@@ -14,13 +14,24 @@ UI shipped as a [Flet](https://flet.dev) application instead of Swing.
 # 1. Create the uv virtual environment (Python 3.14)
 uv venv --python 3.14
 
-# 2. Install the project in editable mode
-uv pip install -e ".[dev]"
+# 2. Install the project in editable mode (add the `web` extra for the
+#    Web Auto recorder)
+uv pip install -e ".[dev,web]"
 
-# 3. Run the tests (scaffold smoke tests only so far)
+# 3. Install the Tesseract OCR binary (default OCR backend — pytesseract
+#    is just the Python wrapper).
+sudo apt install tesseract-ocr           # Debian / Ubuntu
+# brew install tesseract                 # macOS
+# choco install tesseract                # Windows
+
+# 4. Install the Chromium binary Playwright drives (only needed if you
+#    installed the `web` extra above).
+uv run playwright install chromium
+
+# 5. Run the tests (scaffold smoke tests only so far)
 uv run pytest
 
-# 4. Launch Sikuli IDE from console
+# 6. Launch Sikuli IDE from console
 uv run sikulipy-ide
 
 uv run python src/sikulipy/ide/app.py      # direct file path
