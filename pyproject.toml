@@ -29,6 +29,7 @@ dependencies = [
     "typer>=0.12",         # CLI entry point
     "rich>=13.7",          # console UX
     "pytesseract>=0.3.13", # default OCR backend
+    "pytest-playwright>=0.7.2",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,9 @@ vnc = [
 ]
 runners = [
     "robotframework>=7.0",
+]
+web = [
+    "playwright>=1.45",     # Web Auto recorder mode (Phase 11)
 ]
 app = [
     "pywin32>=306 ; platform_system == 'Windows'",

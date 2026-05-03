@@ -38,6 +38,13 @@ class RecorderAction(str, Enum):
     BACK = "back"
     HOME = "home"
     RECENTS = "recents"
+    # Web-only navigation verbs (Phase 11). Emitted as
+    # ``screen.navigate(...)`` / ``screen.reload()`` etc; the recorder bar
+    # hides these buttons unless the active surface is web.
+    NAVIGATE = "navigate"
+    RELOAD = "reload"
+    GO_BACK = "go_back"
+    GO_FORWARD = "go_forward"
 
     @property
     def needs_pattern(self) -> bool:
@@ -62,8 +69,12 @@ class RecorderAction(str, Enum):
         """
         if self in _ANDROID_ONLY_ACTIONS:
             return surface_name == "android"
+        if self in _WEB_ONLY_ACTIONS:
+            return surface_name == "web"
         if self in _DESKTOP_ONLY_ACTIONS:
-            return surface_name != "android"
+            return surface_name == "desktop"
+        if self in _DESKTOP_AND_WEB_ACTIONS:
+            return surface_name in {"desktop", "web"}
         return True
 
 
@@ -71,15 +82,26 @@ class RecorderAction(str, Enum):
 # launch/close-by-window-title, no right-click. Reject these at record
 # time when an Android surface is active.
 _DESKTOP_ONLY_ACTIONS: set[RecorderAction] = {
-    RecorderAction.RCLICK,
     RecorderAction.WHEEL,
     RecorderAction.LAUNCH_APP,
     RecorderAction.CLOSE_APP,
+}
+# Right-click is meaningful on desktop *and* in a browser (context menu)
+# but not on Android (which has long-press instead). Keeping it in a
+# separate bucket lets web codegen accept it while android still rejects.
+_DESKTOP_AND_WEB_ACTIONS: set[RecorderAction] = {
+    RecorderAction.RCLICK,
 }
 _ANDROID_ONLY_ACTIONS: set[RecorderAction] = {
     RecorderAction.BACK,
     RecorderAction.HOME,
     RecorderAction.RECENTS,
+}
+_WEB_ONLY_ACTIONS: set[RecorderAction] = {
+    RecorderAction.NAVIGATE,
+    RecorderAction.RELOAD,
+    RecorderAction.GO_BACK,
+    RecorderAction.GO_FORWARD,
 }
 
 

@@ -159,6 +159,65 @@ class _AndroidSurface:
 
 
 # ---------------------------------------------------------------------------
+# Web (Playwright)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WebSurface:
+    """A web page captured via Playwright (Phase 11).
+
+    Holds the URL the recording is bound to so :meth:`header_setup` can
+    emit the matching ``WebScreen.start(url=...)`` line. Frames come
+    from the active :class:`BrowserBackend`; tests pin a fake.
+    """
+
+    url: str
+    backend: Any = None
+    """A :class:`sikulipy.web.BrowserBackend`. ``None`` resolves to
+    ``get_backend()`` lazily so import-time costs stay off the desktop
+    surface path."""
+    name: str = "web"
+    _bounds: tuple[int, int, int, int] | None = field(default=None, repr=False)
+
+    def _resolve_backend(self) -> Any:
+        if self.backend is not None:
+            return self.backend
+        from sikulipy.web import get_backend
+
+        self.backend = get_backend()
+        return self.backend
+
+    def frame(self) -> "np.ndarray":
+        backend = self._resolve_backend()
+        return backend.frame()
+
+    def bounds(self) -> tuple[int, int, int, int]:
+        if self._bounds is None:
+            backend = self._resolve_backend()
+            try:
+                result = backend.discover()
+            except Exception:
+                result = None
+            if result is not None and all(result.document_size):
+                w, h = result.document_size
+            else:
+                w, h = 1024, 768
+            self._bounds = (0, 0, int(w), int(h))
+        return self._bounds
+
+    def header_imports(self) -> list[str]:
+        return [
+            "from sikulipy import *",
+            "from sikulipy.web.screen import WebScreen",
+        ]
+
+    def header_setup(self) -> list[str]:
+        url = (self.url or "").replace("\\", "\\\\").replace('"', '\\"')
+        return [f'screen = WebScreen.start(url="{url}")']
+
+
+# ---------------------------------------------------------------------------
 # Fake (tests)
 # ---------------------------------------------------------------------------
 

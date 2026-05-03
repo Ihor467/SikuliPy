@@ -38,9 +38,13 @@ from sikulipy.ide.recorder import (
     RecorderAction,
     RecorderSession,
 )
+from sikulipy.ide.recorder.surface import _WebSurface
 from sikulipy.ide.sidebar import SidebarModel
 from sikulipy.ide.statusbar import StatusModel
 from sikulipy.ide.toolbar import DefaultRunnerHost, ToolbarActions
+from sikulipy.ide.web_dialog import WebAutoDialog
+from sikulipy.ide.web_panel import WebAutoController, all_kinds
+from sikulipy.web import ElementKind, WebElement
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +96,14 @@ class _IDEState:
         # an unobstructed view of whatever's underneath. Restored from
         # the runner-finished callback. Empty when the IDE is up.
         self.hidden_run_window_ids: list = []
+        # Web Auto controller (Phase 11). Non-None means the recorder
+        # is in Web Auto mode: the sidebar swaps to the filter/list
+        # pane, and the editor area shows the page screenshot with
+        # overlaid element rectangles.
+        self.web_auto: "WebAutoController | None" = None
+        # Currently-selected element in the Web Auto pane (driven by
+        # the controller's state but cached here for the Flet view).
+        self.web_auto_selected: "WebElement | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1159,320 @@ def _build_editor(
     )
 
 
+def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
+    """Right-hand pane shown while the Web Auto controller is active.
+
+    Layout (top → bottom):
+
+    * Filter checkboxes (one per :class:`ElementKind`).
+    * **Apply** / **Take ElScrsht** / **Close** buttons.
+    * Scrollable element list (``[role] name (W×H)`` per row, full
+      selector as tooltip). Selecting a row updates the bottom
+      preview.
+    * Bottom preview: image of the selected element's crop, lifted
+      from the live screenshot.
+    """
+    controller = state.web_auto
+    assert controller is not None  # type-narrow for the rest of the body
+    cstate = controller.state
+
+    def _toggle(kind: ElementKind):
+        def handler(e: ft.ControlEvent) -> None:
+            controller.set_filter_kind(kind, bool(e.control.value))
+        return handler
+
+    checkbox_rows = [
+        ft.Checkbox(
+            value=cstate.filter.is_enabled(kind),
+            label=kind.label,
+            on_change=_toggle(kind),
+        )
+        for kind in all_kinds()
+    ]
+
+    def _apply(_e):
+        controller.apply_filter()
+
+    def _take(_e):
+        saved = controller.take_screenshots()
+        if saved:
+            state.status.set_message(controller.state.status)
+
+    def _close_web(_e):
+        try:
+            controller.close()
+        finally:
+            state.web_auto = None
+            state.web_auto_selected = None
+            state.status.set_message("Web Auto closed")
+            refresh()
+
+    button_row = ft.Row(
+        controls=[
+            ft.ElevatedButton("Apply", icon=ft.Icons.CHECK, on_click=_apply),
+            ft.ElevatedButton(
+                "Take ElScrsht", icon=ft.Icons.PHOTO_CAMERA, on_click=_take
+            ),
+            ft.ElevatedButton(
+                "Close",
+                icon=ft.Icons.CLOSE,
+                icon_color=ft.Colors.RED,
+                on_click=_close_web,
+            ),
+        ],
+        spacing=6,
+        wrap=True,
+    )
+
+    filtered = cstate.filtered()
+    list_rows: list[ft.Control] = []
+    for el in filtered:
+        is_selected = state.web_auto_selected is el or (
+            state.web_auto_selected is not None
+            and state.web_auto_selected.selector == el.selector
+        )
+        bw = int(el.bounds[2])
+        bh = int(el.bounds[3])
+        row = ft.Row(
+            controls=[
+                ft.Text(
+                    f"[{el.display_role}]",
+                    size=12,
+                    weight=ft.FontWeight.BOLD,
+                    color=ft.Colors.BLUE_700,
+                ),
+                ft.Text(el.display_name, size=12, expand=True),
+                ft.Text(
+                    f"{bw}×{bh}",
+                    size=11,
+                    color=ft.Colors.GREY_700,
+                ),
+            ],
+            spacing=6,
+        )
+
+        def _on_pick(_e, picked=el):
+            state.web_auto_selected = picked
+            controller.select(picked)
+
+        list_rows.append(
+            ft.Container(
+                content=ft.GestureDetector(
+                    content=ft.Container(
+                        content=row,
+                        padding=ft.padding.symmetric(horizontal=4, vertical=2),
+                    ),
+                    on_tap=_on_pick,
+                    mouse_cursor=ft.MouseCursor.CLICK,
+                ),
+                tooltip=el.selector,
+                bgcolor=ft.Colors.BLUE_100 if is_selected else None,
+                border_radius=3,
+            )
+        )
+
+    if not list_rows:
+        list_body: ft.Control = ft.Text(
+            "(no elements match the filter)",
+            italic=True,
+            color=ft.Colors.GREY,
+        )
+    else:
+        list_body = ft.Column(controls=list_rows, scroll=ft.ScrollMode.AUTO, spacing=0)
+
+    preview: ft.Control
+    sel = state.web_auto_selected
+    if sel is None:
+        preview = ft.Text(
+            "(select an element to preview)",
+            italic=True, color=ft.Colors.GREY, size=11,
+        )
+        preview_label = ""
+    else:
+        preview_label = f"[{sel.display_role}] {sel.display_name}"
+        preview = _render_element_preview(controller, sel)
+
+    header = ft.Text(
+        f"Web Auto — {cstate.url or ''} ({len(cstate.elements)} found)",
+        weight=ft.FontWeight.BOLD,
+        size=13,
+    )
+    if cstate.error:
+        header_block: ft.Control = ft.Column(
+            controls=[
+                header,
+                ft.Text(cstate.error, size=11, color=ft.Colors.RED),
+            ],
+            spacing=2,
+        )
+    else:
+        header_block = header
+
+    return ft.Container(
+        content=ft.Column(
+            controls=[
+                header_block,
+                ft.Container(
+                    content=ft.Column(
+                        controls=checkbox_rows,
+                        spacing=0,
+                    ),
+                    padding=ft.padding.symmetric(vertical=4),
+                ),
+                button_row,
+                ft.Divider(height=1, color=ft.Colors.GREY_400),
+                ft.Container(content=list_body, expand=True),
+                ft.Divider(height=1, color=ft.Colors.GREY_400),
+                ft.Text(preview_label or " ", size=12, italic=True),
+                ft.Container(
+                    content=preview,
+                    bgcolor=ft.Colors.WHITE,
+                    border=ft.border.all(1, ft.Colors.GREY_400),
+                    alignment=ft.Alignment.CENTER,
+                    height=160,
+                ),
+            ],
+            spacing=6,
+            expand=True,
+        ),
+        padding=10,
+        width=320,
+        bgcolor=ft.Colors.AMBER_50,
+        border=ft.border.all(1, ft.Colors.AMBER_300),
+    )
+
+
+def _render_element_preview(
+    controller: "WebAutoController", element: "WebElement"
+) -> ft.Control:
+    """Crop ``element`` from the controller's live frame and return an
+    ``ft.Image`` ready for the bottom preview slot. Falls back to a
+    placeholder text when cv2 is unavailable or the crop fails."""
+    backend = controller._resolve_backend()  # noqa: SLF001 - intentional reach
+    try:
+        frame = backend.frame()
+    except Exception as exc:
+        return ft.Text(f"(preview unavailable: {exc})", size=11, color=ft.Colors.RED)
+    try:
+        from sikulipy.web.assets import crop_element
+
+        cropped = crop_element(
+            frame,
+            element.bounds,
+            device_pixel_ratio=controller.state.device_pixel_ratio,
+        )
+        import cv2
+
+        ok, buf = cv2.imencode(".png", cropped)
+        if not ok:
+            raise RuntimeError("cv2.imencode failed")
+        return ft.Image(src=bytes(buf), fit=ft.BoxFit.CONTAIN)
+    except Exception as exc:
+        return ft.Text(f"(preview failed: {exc})", size=11, color=ft.Colors.RED)
+
+
+def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
+    """Replace the editor + explorer area with the page screenshot.
+
+    The screenshot is rendered as a single :class:`ft.Image` inside a
+    scrollable :class:`ft.Column`; overlay rectangles are drawn as
+    positioned, transparent containers in a :class:`ft.Stack` over the
+    image. Hover tooltip carries the element's selector + accessible
+    name. Stays fully read-only: clicks on rectangles select in the
+    sidebar list (handled by the controller's :meth:`select`).
+    """
+    controller = state.web_auto
+    assert controller is not None
+    cstate = controller.state
+    if cstate.screenshot is None or not cstate.screenshot.exists():
+        return ft.Container(
+            content=ft.Text(
+                cstate.error or "(no page loaded yet)",
+                italic=True,
+                color=ft.Colors.GREY,
+            ),
+            alignment=ft.Alignment.CENTER,
+            expand=True,
+        )
+
+    try:
+        png = cstate.screenshot.read_bytes()
+    except Exception as exc:
+        return ft.Container(
+            content=ft.Text(f"(screenshot read failed: {exc})", color=ft.Colors.RED),
+            alignment=ft.Alignment.CENTER,
+            expand=True,
+        )
+
+    dpr = max(0.01, controller.state.device_pixel_ratio)
+    doc_w, doc_h = cstate.document_size
+    if not doc_w or not doc_h:
+        doc_w, doc_h = 1024, 768
+    stack_w = doc_w / dpr
+    stack_h = doc_h / dpr
+
+    # Flet's Image needs an explicit size inside a Stack — without
+    # width/height the page screenshot collapses to zero and the
+    # editor area renders empty.
+    page_image = ft.Image(
+        src=png,
+        width=stack_w,
+        height=stack_h,
+        fit=ft.BoxFit.FILL,
+        left=0,
+        top=0,
+    )
+
+    overlays: list[ft.Control] = [page_image]
+    for el in cstate.filtered():
+        x = el.bounds[0]
+        y = el.bounds[1]
+        w = el.bounds[2]
+        h = el.bounds[3]
+        if w <= 0 or h <= 0:
+            continue
+        is_selected = (
+            state.web_auto_selected is not None
+            and state.web_auto_selected.selector == el.selector
+        )
+        border_color = (
+            ft.Colors.RED if is_selected else ft.Colors.BLUE_400
+        )
+
+        def _on_click(_e, picked=el):
+            state.web_auto_selected = picked
+            controller.select(picked)
+
+        overlays.append(
+            ft.Container(
+                left=x,
+                top=y,
+                width=w,
+                height=h,
+                border=ft.border.all(2, border_color),
+                bgcolor=ft.Colors.with_opacity(0.05, border_color),
+                tooltip=f"[{el.display_role}] {el.display_name}\n{el.selector}",
+                on_click=_on_click,
+            )
+        )
+
+    return ft.Container(
+        content=ft.Column(
+            controls=[
+                ft.Stack(
+                    controls=overlays,
+                    width=stack_w,
+                    height=stack_h,
+                ),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        ),
+        bgcolor=ft.Colors.WHITE,
+        expand=True,
+    )
+
+
 def _build_sidebar(state: _IDEState, refresh: callable) -> ft.Container:
     items = state.sidebar.items()
     # Drop a stale selection if the previously-picked pattern is no longer
@@ -1466,10 +1792,50 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         return f"Inserted {n_lines} line(s); {len(moved)} pattern(s) → {target_dir}"
 
     def _close(_e):
+        if state.web_auto is not None:
+            try:
+                state.web_auto.close()
+            except Exception:
+                pass
+            state.web_auto = None
+            state.web_auto_selected = None
         session.discard()
         state.recorder = None
         state.device_picker = None
         state.status.set_message("Recorder closed")
+        refresh()
+
+    def _start_web_auto(_e):
+        prompt = "Web Auto — please provide URL:"
+        raw = _ask_native_input(prompt, title="Web Auto", default="https://")
+        dialog = WebAutoDialog()
+        dialog.set_text(raw or "")
+        url = dialog.normalize()
+        if url is None:
+            state.status.set_message(
+                f"Web Auto cancelled: {dialog.error or 'no URL'}"
+            )
+            refresh()
+            return
+        controller = WebAutoController(project_dir=state.root)
+        controller.start(url)
+        if controller.state.error:
+            state.status.set_message(f"Web Auto failed: {controller.state.error}")
+            controller.close()
+            refresh()
+            return
+        # Bind the recorder to the new web surface so subsequent records
+        # generate ``screen.click(...)`` against the page.
+        try:
+            session.set_surface(_WebSurface(url=url))
+        except Exception as exc:
+            state.status.set_message(f"Surface bind failed: {exc}")
+        state.web_auto = controller
+        state.web_auto_selected = None
+        # Rebuild on every controller tick so the filter / selection /
+        # status updates flow into the view.
+        controller.subscribe(lambda _s: refresh())
+        state.status.set_message(controller.state.status)
         refresh()
 
     def _payload_row(specs: list[tuple[str, RecorderAction, str]]) -> ft.Row:
@@ -1546,6 +1912,12 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
 
     footer = ft.Row(
         controls=[
+            ft.ElevatedButton(
+                "Web Auto",
+                icon=ft.Icons.PUBLIC,
+                on_click=_start_web_auto,
+                tooltip="Open a URL and capture actionable elements",
+            ),
             ft.Container(expand=True),
             ft.ElevatedButton(
                 "Close",
@@ -1753,7 +2125,10 @@ def ide_main(page: ft.Page) -> None:
         statusbar.update()
 
     def refresh_sidebar() -> None:
-        sidebar_wrapper.content = _build_sidebar(state, refresh)
+        if state.web_auto is not None:
+            sidebar_wrapper.content = _build_web_auto_pane(state, refresh)
+        else:
+            sidebar_wrapper.content = _build_sidebar(state, refresh)
         sidebar_wrapper.update()
 
     def refresh() -> None:
@@ -1765,16 +2140,22 @@ def ide_main(page: ft.Page) -> None:
         # the right portion of the console so it spans only the editor's
         # width while the console behind it still starts at the IDE's
         # left edge.
-        explorer_pane = _build_explorer(state, refresh)
-        editor_pane = _build_editor(
-            state, refresh, refresh_statusbar, refresh_sidebar
-        )
-        editor_row = ft.Row(
-            controls=[explorer_pane, editor_pane],
-            expand=True,
-            spacing=0,
-            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
-        )
+        # While Web Auto is active, the editor + explorer area is
+        # replaced by a scrollable screenshot of the page with the
+        # filtered elements outlined.
+        if state.web_auto is not None:
+            editor_row = _build_web_auto_screenshot(state)
+        else:
+            explorer_pane = _build_explorer(state, refresh)
+            editor_pane = _build_editor(
+                state, refresh, refresh_statusbar, refresh_sidebar
+            )
+            editor_row = ft.Row(
+                controls=[explorer_pane, editor_pane],
+                expand=True,
+                spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+            )
 
         console_pane = _build_console(state, refresh_statusbar)
         recorder_bar = _build_recorder_bar(state, page, refresh)
@@ -1804,7 +2185,10 @@ def ide_main(page: ft.Page) -> None:
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
-        sidebar_wrapper.content = _build_sidebar(state, refresh)
+        if state.web_auto is not None:
+            sidebar_wrapper.content = _build_web_auto_pane(state, refresh)
+        else:
+            sidebar_wrapper.content = _build_sidebar(state, refresh)
         container.controls = [
             ft.Row(
                 controls=[

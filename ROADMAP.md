@@ -322,6 +322,233 @@ output).
   `_DefaultRunnerHost` with the logger enabled; assert the
   `ConsoleBuffer` ends up with one entry per action, in order.
 
+### Phase 11 — Web Auto recorder mode ✅
+Shipped: a new **Web Auto** button in the recorder bar opens a popup
+asking for a URL, launches a Playwright-driven Chromium, and turns the
+sidebar into an element-aware capture pane (filter checkboxes per
+:class:`ElementKind`, scrollable element list with role/name + selector
+tooltip, bottom preview, *Apply* / *Take ElScrsht* / *Close* buttons).
+The editor + explorer area is replaced by a scrollable page screenshot
+with the filtered elements outlined. Recorded actions emit
+``screen.click(Pattern(...))`` against a session-bound
+``WebScreen.start(url=...)``.
+
+* `web/_backend.py` — `BrowserBackend` Protocol + lazy
+  `_PlaywrightBackend` + in-memory `_FakeBackend`; ``get_backend`` /
+  ``set_backend`` singleton.
+* `web/elements.py` — ``WebElement`` dataclass, ``ElementKind`` enum,
+  the ``DISCOVERY_JS`` payload Playwright evaluates, plus a
+  ``classify(tag, type, role)`` mapper.
+* `web/filters.py` — ``ElementFilter`` (toggle by kind, ``apply``).
+* `web/assets.py` — ``asset_root(project, url)`` carves
+  ``<project>/assets/web/<host>/``; ``slug_for_element`` builds
+  collision-resistant filenames; ``crop_element`` slices a tight bbox
+  + 4 px padding (DPR-aware).
+* `web/screen.py` — ``WebScreen(Region)`` singleton-by-URL with
+  ``click`` / ``double_click`` / ``right_click`` / ``hover`` /
+  ``drag_drop`` / ``type`` plus ``navigate`` / ``reload`` /
+  ``go_back`` / ``go_forward``; capture pulls the latest backend
+  frame.
+* `ide/recorder/surface.py:_WebSurface` — third peer of
+  ``_DesktopSurface`` / ``_AndroidSurface``; ``header_imports`` +
+  ``header_setup`` inject ``WebScreen.start(url=...)``.
+* `ide/recorder/codegen.py` — ``_gen_web`` branch (mirrors android,
+  plus web-only nav verbs). ``ide/recorder/workflow.py`` adds
+  ``NAVIGATE`` / ``RELOAD`` / ``GO_BACK`` / ``GO_FORWARD`` and a new
+  ``_DESKTOP_AND_WEB_ACTIONS`` bucket so RCLICK is allowed on desktop
+  + web but not android.
+* `ide/web_dialog.py:WebAutoDialog` — URL prompt model with scheme
+  validation (rejects ``javascript:``/``data:``/``file:``/etc.,
+  upgrades bare hosts to ``https://``).
+* `ide/web_panel.py:WebAutoController` — headless state machine:
+  ``start`` → launch → goto → screenshot → discover; ``set_filter_kind``
+  / ``apply_filter`` / ``select`` / ``take_screenshots`` / ``refresh``
+  / ``close``. Subscriber fan-out drives the IDE refresh.
+* `ide/app.py` — recorder footer gains the **Web Auto** button; while
+  active, ``refresh()`` swaps the editor row for a scrollable page
+  screenshot with overlay rectangles, and the sidebar for the filter
+  + list + preview pane.
+* `pyproject.toml` — new ``web`` extra (``playwright>=1.45``).
+* Tests: 42 in ``tests/test_phase11_web_*.py`` — backend round-trip
+  (5), filter (5), assets (8), surface + codegen (9), controller
+  (7), dialog (8). Every test uses ``_FakeBackend``; no Chromium
+  download or live network needed.
+
+Below is the original step-by-step plan, kept for reference.
+
+#### Original goal & design notes
+
+Goal: a new **Web Auto** button in the recorder bar opens a popup
+asking for a URL, launches a headed Playwright browser, and turns the
+IDE into an element-aware capture surface for that page. The Patterns
+pane lists every actionable element Playwright can discover, filtered
+by user-toggled checkboxes. Selecting an element shows its cropped
+image; *Take ElScrsht* batch-saves PNGs into the project's web-asset
+folder. The editor pane is replaced by a scrollable screenshot of the
+page with the filtered elements outlined. *Close* tears the mode down
+and restores the normal IDE layout. A `WebScreen` surface (third
+peer of `_DesktopSurface` / `_AndroidSurface`) lets recorded actions
+target the same browser, so codegen emits `screen.click(Pattern(...))`
+against a Playwright-driven page.
+
+#### Design constraints
+
+* **Playwright as the engine.** New `web` pyproject extra
+  (`playwright`); the IDE prompts the user to run
+  `playwright install chromium` on first use if the browser is
+  missing. Headed mode by default so the user can authenticate or
+  dismiss cookie banners; auto-snapshot when the page reaches
+  `networkidle` + 1 s, with a manual *Refresh* fallback.
+* **Reuses Phase 9 surface plumbing.** `WebSurface` implements
+  `TargetSurface`; `screenshot()` returns the current page PNG,
+  `bounds()` is the viewport in CSS pixels, `header_imports()` injects
+  `from sikulipy.web.screen import WebScreen` and a `screen =
+  WebScreen.start(url=...)` line. Existing `recorder/codegen.py`
+  dispatch table gets a third branch.
+* **Headless-testable.** The element discovery, filter, list model,
+  and screenshot+overlay layout live in `web/` and `ide/web_panel.py`
+  as pure-Python classes. Tests inject a fake `BrowserBackend`
+  recording the calls Playwright would make. No `cv2`, no live
+  browser, no network in the test path.
+* **Single-window flow.** No separate browser window stays in front of
+  the IDE while the user picks elements — the IDE pane shows the
+  static page screenshot with overlays, and Playwright is reduced
+  to a backend service. The headed browser is only visible during
+  the initial navigate / login phase; the IDE iconifies it once the
+  snapshot is taken.
+
+#### Module layout
+
+* `web/_backend.py` — `BrowserBackend` Protocol
+  (`launch`, `goto`, `wait_until_idle`, `screenshot`, `discover`,
+  `close`) + `_PlaywrightBackend` (lazy import) + `_FakeBackend` for
+  tests. `get_backend()` / `set_backend()` mirror the OCR/Native/Guide
+  patterns.
+* `web/elements.py` — `WebElement(role, name, selector, xpath,
+  bounds, kind)` dataclass + `ElementKind` enum (`LINK`, `BUTTON`,
+  `INPUT`, `CHECKBOX_RADIO`, `SELECT`, `MENU`, `TAB`, `OTHER`).
+  Discovery is one Playwright `page.evaluate(...)` call returning
+  every element matched by a built-in selector union — anchors,
+  buttons, every `[role]` Playwright lists, all form controls, plus a
+  catch-all for `[onclick]` / `tabindex`. Visible-only filtering
+  (offsetParent + clientRect non-empty + not `aria-hidden`).
+* `web/filters.py` — `ElementFilter(kinds: set[ElementKind])` with
+  `apply(elements) -> list[WebElement]`; default = all kinds enabled.
+* `web/screen.py` — `WebScreen(Region)` subclass; `_capture_bgr` pulls
+  a fresh screenshot via the backend, `click`/`type`/`drag_drop` route
+  through Playwright `page.mouse` / `page.keyboard`. Pattern targets
+  resolved via the standard `find()` path against the captured frame.
+  Singleton-by-URL like `VNCScreen.start`.
+* `web/assets.py` — `asset_root(project_dir, url) -> Path` returns
+  `<project>/assets/web/<host>/`; `crop_element(frame, bounds, pad=4)`
+  → BGR ndarray written via `cv2.imwrite`; filename slug from the
+  element's accessible name + role + short selector hash.
+
+#### IDE wiring
+
+* `recorder/surface.py` — new `_WebSurface(WebScreen)` peer of
+  `_DesktopSurface` / `_AndroidSurface`. `header_imports()` returns
+  `["from sikulipy.web.screen import WebScreen"]`. `header_setup()`
+  emits `screen = WebScreen.start(url="...")`.
+* `ide/web_panel.py` — headless model:
+  * `WebAutoState` (URL, last screenshot path, element list, filter,
+    selected element, asset folder).
+  * `WebAutoController(backend, asset_resolver, on_change)` —
+    `start(url)` → `discover` → `set_filter` → `take_screenshots` →
+    `close`. Pure-Python, no Flet imports.
+* `ide/web_dialog.py` — popup model: URL field, OK/Cancel callbacks,
+  validation (must parse as `http(s)://...`). Returns a normalised URL.
+* `ide/app.py` — recorder bar gains a **Web Auto** button. While
+  `WebAutoState.active`:
+  * Editor + explorer area is replaced by a scrollable
+    `Stack(Image(screenshot.png), overlay_canvas)`. Overlay draws one
+    coloured rectangle per filtered element; hover shows a tooltip
+    with role + name + selector. Click on a rectangle selects the
+    element in the sidebar list.
+  * Patterns pane swaps for the Web Auto pane: a `Column` with the
+    filter checkboxes (Links / Buttons / Inputs / Checkbox-Radio /
+    Selects / Menus & Tabs / Other), three buttons (**Apply**,
+    **Take ElScrsht**, **Close**), the filtered element list (each
+    row: `[role] name (W×H)` with the full selector as a tooltip),
+    and a bottom preview `Image` of the selected element's crop.
+  * Status bar segment: `Web Auto: example.com — 47 elements`.
+* **Apply** re-runs `filter.apply()` and refreshes the overlay + list.
+* **Take ElScrsht** crops every currently filtered element via
+  `assets.crop_element` and writes the PNGs into
+  `<project>/assets/web/<host>/`; status bar shows `Saved 47 elements
+  → assets/web/example.com/`.
+* **Close** tears the mode down: stops the backend, restores the
+  editor / explorer / patterns pane, leaves the saved PNGs on disk.
+
+#### Codegen
+
+* `recorder/codegen.py` — Web branch mirrors Android:
+  `RecorderAction.CLICK` → `screen.click(Pattern("login_btn.png"))`;
+  `TYPE` → `screen.type("hello")`; `WAIT` → `time.sleep(...)`. Web-only
+  verbs (`NAVIGATE`, `BACK`, `FORWARD`, `RELOAD`) reject on other
+  surfaces. Desktop-only verbs (`KEY_COMBO` modifier chords,
+  `LAUNCH_APP`) reject on Web.
+* `recorder/workflow.py` — extend the surface_only attribute matrix.
+
+#### Tests
+
+* `tests/test_phase11_web_backend.py` — `_FakeBackend` round-trip:
+  `launch` → `goto` → `discover` returns N elements → `screenshot`
+  writes a PNG → `close` releases. Verify discovery payload shape
+  (role, name, selector, bounds) without spawning Chromium.
+* `tests/test_phase11_web_filter.py` — every checkbox combination
+  filters the element list correctly; visible-only filtering rejects
+  display:none / aria-hidden / offscreen elements.
+* `tests/test_phase11_web_assets.py` — `asset_root` carves
+  `<project>/assets/web/<host>/`; `crop_element` writes PNGs with the
+  expected filename pattern; idempotent across reruns.
+* `tests/test_phase11_web_surface.py` — `_WebSurface` integrates with
+  `RecorderSession` like the Android peer; codegen emits the
+  expected `screen.*` calls; surface-mismatched actions raise.
+* `tests/test_phase11_web_panel.py` — `WebAutoController` state
+  machine: `start` → discovery results land in state; `set_filter` →
+  list narrows; `take_screenshots` calls the asset resolver per
+  element; `close` resets state. Subscribers fire on every change.
+* `tests/test_phase11_web_dialog.py` — URL validation accepts
+  `https://example.com`, rejects empty / `javascript:` / non-URL
+  strings. Cancel returns `None`.
+
+#### Risks & open questions
+
+* **Playwright install size.** Chromium download is ~150 MB. Keeping
+  it behind the `web` extra is mandatory; first-run prompt should
+  link to the Playwright install docs rather than running it
+  silently.
+* **Auth walls.** Headed browser solves the simple case (user logs in
+  manually before the snapshot). SSO redirects that bounce through
+  multiple domains will need a configurable navigation timeout and a
+  *Snapshot now* button as escape hatch.
+* **Iframe traversal.** First pass discovers the top-level document
+  only. Cross-origin iframes (ads, captchas) are skipped. Same-origin
+  iframes are a follow-up — the discovery JS would need to recurse
+  via `page.frames()`.
+* **Element stability.** A page that mutates after `networkidle`
+  (lazy-loaded carousels, banners) can desync the screenshot from
+  the live element list. Mitigation: re-snapshot on every Apply, and
+  surface a "page changed since last snapshot" warning in the status
+  bar if the next click target's bbox no longer matches the captured
+  frame.
+* **Coordinate mapping.** Playwright `bounding_box()` returns CSS
+  pixels; the screenshot is rendered at device pixel ratio. Overlay
+  layer must scale by `window.devicePixelRatio` (read once via
+  `page.evaluate`) so rectangles stay aligned. Verified in unit tests
+  by using a fake DPR ≠ 1.
+* **Long pages.** Full-page screenshots can run to 20 000+ pixels
+  tall; rendering the overlay with one Flet `Container` per element
+  is fine up to ~2 000 elements but past that the Stack stutters.
+  Cap the rendered overlay to elements within the visible scroll
+  viewport, lazy-render the rest on scroll.
+* **WebScreen vs. desktop browser.** A user might prefer recording
+  against the *real* browser they already have open (so cookies,
+  sessions, extensions Just Work). That's a future "Attach to
+  browser via CDP" follow-up — Playwright's `connect_over_cdp` makes
+  it cheap once the discovery + UI layer exists.
+
 ## Out of scope (for now)
 
 * MCP module — Java-specific, superseded by Python MCP SDKs
@@ -342,6 +569,7 @@ org.sikuli.natives.*          -> sikulipy.natives
 org.sikuli.support.recorder.* -> sikulipy.recorder
 org.sikuli.script.runners.*   -> sikulipy.runners
 org.sikuli.ide.*              -> sikulipy.ide   (Flet, not Swing)
+(new)                         -> sikulipy.web   (Playwright, Phase 11)
 com.sikulix.ocr.*             -> sikulipy.ocr
 com.sikulix.util.SSHTunnel    -> sikulipy.vnc.ssh
 com.sikulix.tigervnc.*        -> sikulipy.vnc   (wrapped by vncdotool)

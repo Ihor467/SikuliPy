@@ -67,6 +67,8 @@ class PythonGenerator:
             )
         if gi.surface == "android":
             return self._gen_android(action, gi)
+        if gi.surface == "web":
+            return self._gen_web(action, gi)
         return self._gen_desktop(action, gi)
 
     def _gen_desktop(self, action: RecorderAction, gi: GenInput) -> str:
@@ -199,6 +201,71 @@ class PythonGenerator:
             return 'screen.device.key_event("KEYCODE_HOME")'
         if action is RecorderAction.RECENTS:
             return 'screen.device.key_event("KEYCODE_APP_SWITCH")'
+        if action is RecorderAction.TEXT_CLICK:
+            if not gi.payload:
+                raise ValueError("text_click needs a payload")
+            return f"screen.click(screen.find_text({_py_str(gi.payload)}))"
+        if action is RecorderAction.TEXT_WAIT:
+            if not gi.payload:
+                raise ValueError("text_wait needs a payload")
+            return (
+                f"screen.wait_text({_py_str(gi.payload)}, "
+                f"{_fmt_num(gi.timeout)})"
+            )
+        if action is RecorderAction.TEXT_EXISTS:
+            if not gi.payload:
+                raise ValueError("text_exists needs a payload")
+            return f"screen.has_text({_py_str(gi.payload)})"
+
+        raise ValueError(f"unknown action: {action}")
+
+
+    def _gen_web(self, action: RecorderAction, gi: GenInput) -> str:
+        # Web dispatches through a session-bound ``screen`` variable
+        # (the finalize step injects ``screen = WebScreen.start(url=...)``).
+        # Pattern matching against a screenshot of the page works the
+        # same way as Android — find-and-click in one call.
+        if action.needs_pattern:
+            if not gi.pattern:
+                raise ValueError(f"{action.value} needs a pattern")
+            pat = _pattern_expr(gi.pattern, gi.similarity)
+            t = _fmt_num(gi.timeout)
+            if action is RecorderAction.CLICK:
+                return f"screen.click({pat})"
+            if action is RecorderAction.DBLCLICK:
+                return f"screen.double_click({pat})"
+            if action is RecorderAction.RCLICK:
+                # Right-click is meaningful in a browser (context menu);
+                # surface_only keeps RCLICK out of android but allows web.
+                return f"screen.right_click({pat})"
+            if action is RecorderAction.WAIT:
+                return f"screen.wait({pat}, {t})"
+            if action is RecorderAction.WAIT_VANISH:
+                return f"screen.wait_vanish({pat}, {t})"
+
+        if action.needs_two_patterns:
+            if not gi.pattern or not gi.pattern2:
+                raise ValueError(f"{action.value} needs two patterns")
+            src = _pattern_expr(gi.pattern, gi.similarity)
+            dst = _pattern_expr(gi.pattern2, gi.similarity)
+            if action is RecorderAction.DRAG_DROP:
+                return f"screen.drag_drop({src}, {dst})"
+
+        if action is RecorderAction.TYPE:
+            return f"screen.type({_py_str(gi.payload or '')})"
+        if action is RecorderAction.PAUSE:
+            secs = gi.payload or "1"
+            return f"sleep({_fmt_num(float(secs))})"
+        if action is RecorderAction.NAVIGATE:
+            if not gi.payload:
+                raise ValueError("navigate needs a payload (URL)")
+            return f"screen.navigate({_py_str(gi.payload)})"
+        if action is RecorderAction.RELOAD:
+            return "screen.reload()"
+        if action is RecorderAction.GO_BACK:
+            return "screen.go_back()"
+        if action is RecorderAction.GO_FORWARD:
+            return "screen.go_forward()"
         if action is RecorderAction.TEXT_CLICK:
             if not gi.payload:
                 raise ValueError("text_click needs a payload")
