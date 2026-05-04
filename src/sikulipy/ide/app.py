@@ -1371,6 +1371,21 @@ def _render_element_preview(
         return ft.Text(f"(preview failed: {exc})", size=11, color=ft.Colors.RED)
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    """Return (width, height) in pixels from a PNG byte string, or
+    (0, 0) if the header isn't a valid PNG IHDR. Avoids pulling in
+    Pillow just to size the Web Auto screenshot."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return 0, 0
+    import struct
+
+    try:
+        width, height = struct.unpack(">II", data[16:24])
+    except struct.error:
+        return 0, 0
+    return int(width), int(height)
+
+
 def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
     """Replace the editor + explorer area with the page screenshot.
 
@@ -1405,11 +1420,23 @@ def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
         )
 
     dpr = max(0.01, controller.state.device_pixel_ratio)
-    doc_w, doc_h = cstate.document_size
-    if not doc_w or not doc_h:
-        doc_w, doc_h = 1024, 768
-    stack_w = doc_w / dpr
-    stack_h = doc_h / dpr
+    # Trust the captured PNG's pixel dimensions over discover()'s
+    # documentSize: the discover JS runs after screenshot(), and on
+    # pages with lazy-loaded media or animated layout, scrollHeight
+    # drifts between the two calls. A mismatched stack_h with
+    # BoxFit.FILL stretches the image vertically and the overlays —
+    # which use bounds from discover() — drift relative to the
+    # rendered pixels (worse toward the bottom of the page).
+    png_w, png_h = _png_dimensions(png)
+    if png_w and png_h:
+        stack_w = png_w / dpr
+        stack_h = png_h / dpr
+    else:
+        doc_w, doc_h = cstate.document_size
+        if not doc_w or not doc_h:
+            doc_w, doc_h = 1024, 768
+        stack_w = doc_w / dpr
+        stack_h = doc_h / dpr
 
     # Flet's Image needs an explicit size inside a Stack — without
     # width/height the page screenshot collapses to zero and the
@@ -1457,7 +1484,7 @@ def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
         )
 
     return ft.Container(
-        content=ft.Column(
+        content=ft.ListView(
             controls=[
                 ft.Stack(
                     controls=overlays,
@@ -1465,11 +1492,11 @@ def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
                     height=stack_h,
                 ),
             ],
-            scroll=ft.ScrollMode.AUTO,
             expand=True,
         ),
         bgcolor=ft.Colors.WHITE,
         expand=True,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
     )
 
 
@@ -1807,7 +1834,11 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
 
     def _start_web_auto(_e):
         prompt = "Web Auto — please provide URL:"
-        raw = _ask_native_input(prompt, title="Web Auto", default="https://")
+        # Hide the IDE before popping the native input — on KWin the
+        # kdialog/zenity window otherwise lands behind the IDE and the
+        # user sees a "nothing happened" click.
+        with _ide_hidden(page):
+            raw = _ask_native_input(prompt, title="Web Auto", default="https://")
         dialog = WebAutoDialog()
         dialog.set_text(raw or "")
         url = dialog.normalize()

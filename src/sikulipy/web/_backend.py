@@ -206,7 +206,13 @@ class _PlaywrightBackend:
 
             self._pw = sync_playwright().start()
             self._browser = self._pw.chromium.launch(headless=not headed)
-            self._context = self._browser.new_context()
+            # Match the Web Auto screenshot pane, which spans the full
+            # IDE width (Explorer + Editor area). Playwright defaults to
+            # 1280×720; that leaves an explorer-width gap on the right
+            # of the pane on typical 1500+ px IDE windows.
+            self._context = self._browser.new_context(
+                viewport={"width": 1600, "height": 900}
+            )
             self._page = self._context.new_page()
 
         self._submit(_do)
@@ -238,6 +244,43 @@ class _PlaywrightBackend:
             if self._page is None:
                 raise RuntimeError("call launch() before screenshot()")
             target.parent.mkdir(parents=True, exist_ok=True)
+            # goto() returns on the ``load`` event, which fires before
+            # late-arriving fonts, images, and footer scripts settle.
+            # Two things can clip the footer from full_page screenshots:
+            #   1. Lazy-loaded sections (IntersectionObserver / "load
+            #      more on scroll") only mount once they enter the
+            #      viewport — so we walk the page top→bottom in
+            #      viewport-sized steps to force every section to
+            #      render before we capture.
+            #   2. Even after walking, fonts / images / animations need
+            #      a moment to paint at their final size, so we settle
+            #      once at the bottom and once back at the top.
+            try:
+                self._page.evaluate(
+                    """async () => {
+                        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                        const step = window.innerHeight || 800;
+                        let lastH = 0;
+                        for (let i = 0; i < 60; i++) {
+                            const h = document.documentElement.scrollHeight;
+                            const y = Math.min(i * step, h);
+                            window.scrollTo(0, y);
+                            await sleep(120);
+                            if (y >= h && h === lastH) break;
+                            lastH = h;
+                        }
+                        window.scrollTo(0, document.documentElement.scrollHeight);
+                        await sleep(400);
+                        window.scrollTo(0, 0);
+                        await sleep(200);
+                    }"""
+                )
+            except Exception:
+                pass
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
             png_bytes = self._page.screenshot(full_page=True, type="png")
             target.write_bytes(png_bytes)
             self._last_screenshot = target
