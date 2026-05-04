@@ -549,6 +549,248 @@ against a Playwright-driven page.
   browser via CDP" follow-up — Playwright's `connect_over_cdp` makes
   it cheap once the discovery + UI layer exists.
 
+### Phase 12 — Image-driven test generation (POM)
+
+Goal: turn a Web Auto capture session into a runnable, maintainable
+pytest suite where elements are referenced by their cropped PNG (not
+by CSS selector), assertions are made by OpenCV image comparison
+against a "golden" baseline, and any text inside an element is
+verified through Tesseract OCR + Levenshtein-ratio matching. The
+generated code follows the Page Object Model: one `pages/<host>.py`
+holds the image catalogue and action/assertion methods; the
+`tests/<feature>.py` modules call those methods and stay readable
+even after a UI refresh.
+
+#### Why image-as-locator (not selector-as-locator)
+
+* Selectors break on every framework rerender; the screenshot the
+  recorder already captured *is* the contract the user signed off on.
+* SikuliPy's matcher (`Finder.find` over `cv2.matchTemplate` + greedy
+  NMS) is already wired to handle DPR/scale via `Pattern.similarity`.
+  Reusing it keeps Web Auto symmetrical with the desktop / Android
+  surfaces.
+* Selector-based tests already exist (Playwright, Selenium); the
+  differentiator here is "the test fails when the *visual* changes",
+  which is what users record Web Auto for in the first place.
+
+#### Page Object layout
+
+```
+project/
+  assets/web/<host>/                # populated by Take ElScrsht
+    login_btn.png
+    username_field.png
+    welcome_banner.png
+  baselines/web/<host>/             # NEW — golden crops + region full-frames
+    login_btn.png
+    welcome_banner.png
+    home_hero.png
+  pages/                            # NEW — generated Page Objects
+    __init__.py
+    example_com.py                  # one module per host
+  tests/                            # NEW — generated test modules
+    web/
+      conftest.py
+      test_example_com_login.py
+```
+
+Each `pages/<host>.py` exposes:
+
+```python
+class ExampleCom(WebPageObject):
+    URL = "https://example.com"
+
+    # Catalogue — the image is the locator; selector is a fallback
+    # only used when the image match dips below ``min_similarity``.
+    LOGIN_BTN = ImageLocator("login_btn.png", selector="button[type=submit]")
+    USERNAME  = ImageLocator("username_field.png", selector="#username")
+    WELCOME   = ImageLocator("welcome_banner.png")
+
+    # Action methods (stateful flows live here)
+    def login(self, username: str, password: str) -> None: ...
+    def open_account_menu(self) -> None: ...
+
+    # Assertion methods (Page Object owns the *meaning* of the check;
+    # tests stay declarative)
+    def expect_welcome(self, name: str) -> None: ...
+    def expect_logged_out(self) -> None: ...
+```
+
+The base class `WebPageObject` in `sikulipy.testing.pom` wraps a
+`WebScreen`, the `assets` folder, the `baselines` folder, and the
+comparison thresholds. It provides primitives (`click(locator)`,
+`type(locator, text)`, `expect_visual(locator)`, `expect_text(
+locator, expected)`) so generated subclasses stay thin.
+
+#### New module: `sikulipy.testing` (under `src/sikulipy/testing/`)
+
+* `compare.py` — `compare_images(actual, expected, *, mode,
+  threshold) -> ImageDiff`. Three modes:
+  * `mode="exact"` — `cv2.absdiff` + per-pixel mask; fails if any
+    pixel exceeds `tolerance` (default 8/255) and total diff fraction
+    exceeds `threshold` (default 0.005).
+  * `mode="ssim"` — `skimage.metrics.structural_similarity` (added as
+    optional dep); robust to anti-aliasing / font hinting drift.
+    Fails if `score < threshold` (default 0.97).
+  * `mode="template"` — `cv2.matchTemplate(TM_CCOEFF_NORMED)`; passes
+    if best match `>= threshold` (default 0.92). Used when the
+    actual frame is the full page and the expected is a tight crop.
+  Returns `ImageDiff(passed, score, diff_image, bbox)` so the runner
+  can dump artefacts on failure.
+* `ocr_assert.py` — `compare_text(actual_image, expected, *,
+  ratio_threshold=0.85, normalize=...)`. Pulls text via the existing
+  `OCR` facade (defaults to `TesseractBackend`), normalises (lower,
+  collapse whitespace, optional diacritic strip), then computes
+  Levenshtein ratio (`1 - distance/max(len)`) and asserts
+  `ratio >= ratio_threshold`. Returns `TextDiff(passed, ratio,
+  expected_norm, actual_norm)`.
+* `pom.py` — `WebPageObject` base, `ImageLocator` dataclass
+  (`asset`, `selector`, `min_similarity`, `mode`, `text`), and the
+  pytest hooks that record diff artefacts to `tests/.diffs/<run>/`.
+* `baseline.py` — `BaselineStore`: load / write / promote.
+  `--update-baselines` (pytest CLI flag added in `conftest.py`)
+  rewrites the golden image with the captured frame on the next run
+  and emits a one-line note per replaced file.
+* `levenshtein.py` — vendored `_levenshtein(a, b) -> int` in pure
+  Python (~30 lines); avoids pulling `python-Levenshtein` (C ext) or
+  `rapidfuzz` for what's a hot loop only on assertion failure paths.
+  If `rapidfuzz` is installed we delegate (much faster on long
+  strings); detection is lazy.
+
+#### IDE: "Generate tests" button
+
+* `ide/web_panel.py:WebAutoController.generate_tests(scenario)` —
+  given a scenario name, takes the current filtered elements +
+  recorded actions and writes:
+  * one Page Object module if it doesn't exist (or appends new
+    locators to the existing one),
+  * one test module per scenario,
+  * baselines folder seeded with copies of the saved PNGs (the user
+    can later re-run the suite with `--update-baselines` once the
+    UI is reviewed).
+* `ide/recorder/codegen.py` — new `_gen_pom_test` branch that emits
+  Page-Object-style code instead of inline `screen.click(Pattern(
+  ...))`. Keyed off a recorder-bar dropdown: **Inline script** (the
+  existing Phase 11 output) vs **POM test** (the new generator).
+  Reuses `RecorderSession.records()` so nothing changes upstream.
+* `ide/app.py` — recorder footer gets a **Generate tests** button
+  next to **Web Auto**; enabled only when the recorder has at least
+  one record and a Web Auto controller is active. Click → name
+  prompt (`_ask_native_input`) → controller emits the files →
+  status bar shows `Wrote pages/example_com.py + tests/web/
+  test_example_com_login.py`.
+
+#### Codegen template (POM mode)
+
+For one recorded login flow:
+
+```python
+# pages/example_com.py — generated, hand-edit safe
+from sikulipy.testing.pom import WebPageObject, ImageLocator
+
+
+class ExampleCom(WebPageObject):
+    URL = "https://example.com"
+
+    USERNAME  = ImageLocator("username_field.png", selector="#username")
+    PASSWORD  = ImageLocator("password_field.png", selector="#password")
+    LOGIN_BTN = ImageLocator("login_btn.png", selector="button[type=submit]")
+    WELCOME   = ImageLocator("welcome_banner.png", text="Welcome,")
+
+    def login(self, username: str, password: str) -> None:
+        self.type(self.USERNAME, username)
+        self.type(self.PASSWORD, password)
+        self.click(self.LOGIN_BTN)
+
+    def expect_welcome(self, name: str) -> None:
+        self.expect_visual(self.WELCOME)
+        self.expect_text(self.WELCOME, f"Welcome, {name}")
+```
+
+```python
+# tests/web/test_example_com_login.py — generated
+import pytest
+from pages.example_com import ExampleCom
+
+
+@pytest.fixture
+def page(web_screen):
+    return ExampleCom.start(web_screen)
+
+
+def test_login_happy_path(page: ExampleCom) -> None:
+    page.login("alice", "hunter2")
+    page.expect_welcome("alice")
+```
+
+The `web_screen` fixture in `tests/web/conftest.py` launches the
+Playwright backend (headless by default, `--headed` flag for
+debugging), navigates to `cls.URL`, and tears down on session end.
+
+#### Tests for the test-generator
+
+* `tests/test_phase12_compare.py` — exact / ssim / template modes;
+  diff artefact emission; tolerance edge cases.
+* `tests/test_phase12_ocr_assert.py` — Levenshtein ratio thresholds;
+  whitespace + case normalisation; backend swap to a fake OCR.
+* `tests/test_phase12_levenshtein.py` — parity with `rapidfuzz`
+  when installed, fallback path when not.
+* `tests/test_phase12_baseline.py` — `--update-baselines` rewrites
+  the golden, normal run leaves it alone, missing baseline emits a
+  helpful "run with --update-baselines" message.
+* `tests/test_phase12_pom.py` — `WebPageObject.click/type/
+  expect_visual/expect_text` against a fake `WebScreen`; locator
+  resolution prefers the image, falls back to selector when
+  similarity dips below `min_similarity`.
+* `tests/test_phase12_codegen.py` — POM generator emits a parseable
+  Page Object module + test module from a synthetic recorder
+  session; round-trips through `ast.parse` so we know the generated
+  code at least imports.
+* `tests/test_phase12_controller.py` — `generate_tests(scenario)`
+  writes the expected files, refuses to clobber an existing test
+  module without `force=True`, populates the baselines folder.
+
+#### Risks & open questions
+
+* **OCR brittleness.** Tesseract on raw screen pixels is noisy
+  (memory: `project_tesseract_preprocessing.md`). We must pass the
+  cropped element through the same upscale/threshold pipeline as
+  the desktop OCR backend before measuring Levenshtein, otherwise
+  short labels ("OK", "✕") OCR to junk and the ratio threshold
+  can't compensate.
+* **Anti-aliasing & subpixel font hinting.** Pixel-exact comparison
+  fails between Linux/macOS/CI even on identical pages. Default
+  mode should be `ssim`, not `exact`; `exact` is for icons / brand
+  marks the user marked as static.
+* **Baseline discipline.** Without `--update-baselines` and a clear
+  diff artefact, this turns into "rerun until green". Diff PNGs
+  must land at a stable path the IDE's status bar can link to.
+* **Locator drift vs. baseline drift.** If the page redesign moves
+  an element *and* repaints it, the image locator finds nothing
+  *and* the baseline fails. The CSS-selector fallback in
+  `ImageLocator.selector` is the recovery path — when the image
+  match dips below `min_similarity` we re-resolve via the selector,
+  capture the new crop, and surface a "locator drifted; run
+  --update-baselines to refresh" warning.
+* **OCR runtime cost.** Tesseract on every assertion would slow
+  tests significantly; the comparator should short-circuit text
+  checks when the visual diff already passed at high confidence
+  (`ssim >= 0.99`) — text is a fallback signal, not a duplicate.
+* **Cross-DPR captures.** A baseline captured at DPR=2 (Retina)
+  won't match a CI runner at DPR=1. Baselines are stored at the
+  CSS-pixel size (`crop / dpr`) so the comparison is DPR-agnostic;
+  documented in `BaselineStore.write`.
+* **Headless-vs-headed parity.** Headless Chromium hides scrollbars
+  and renders fonts slightly differently. The `web_screen` fixture
+  pins viewport + colour scheme + reduced-motion via Playwright
+  `new_context` options so a test that passes locally also passes
+  in CI.
+* **Out of scope for Phase 12.** Multi-page flows that span
+  navigations stay on the user; we provide `WebPageObject.navigate(
+  url)` and `expect_url(...)` but no auto-discovery of "page B" on
+  click. Visual A/B regression dashboards are also out — diffs land
+  on disk, not in a viewer.
+
 ## Out of scope (for now)
 
 * MCP module — Java-specific, superseded by Python MCP SDKs
