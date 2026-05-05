@@ -798,6 +798,26 @@ debugging), navigates to `cls.URL`, and tears down on session end.
 * The embedded `jcraft/jsch`, `jadb`, `keymaster`, and `jxgrabkey`
   third-party forks — all replaced by Python equivalents
 
+## Web Auto asset filename convention
+
+Each cropped element PNG written by Web Auto (`Take ElScrsht`) uses the
+slug:
+
+```
+<role>-<name>-<hash>.png
+```
+
+* **role** — the element's ARIA role or HTML tag (`button`, `link`,
+  `a`, `input`), lowercased.
+* **name** — the accessible name (aria-label / button text / placeholder
+  / alt), slugified.
+* **hash** — first 6 hex digits of `sha1(element.selector)`. The
+  selector is unique per element on the page, so the hash is a stable
+  disambiguator: two visually identical elements (e.g. multiple "Add to
+  cart" buttons) share the same role and name but get distinct
+  filenames, and the same element regenerates the same hash across
+  re-runs. Implemented in `sikulipy.web.assets.slug_for_element`.
+
 ## Module-map quick lookup
 
 ```

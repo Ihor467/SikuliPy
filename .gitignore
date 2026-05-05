@@ -31,3 +31,8 @@ htmlcov/
 # don't ship them).
 examples/tablet_screenshot.png
 examples/*.png
+
+# Web Auto runtime output: per-host screenshot cache + cropped element
+# PNGs land here when the IDE runs against the repo as project_dir.
+.sikulipy/
+/assets/

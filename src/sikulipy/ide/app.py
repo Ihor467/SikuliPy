@@ -1182,10 +1182,15 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
         return handler
 
     checkbox_rows = [
-        ft.Checkbox(
-            value=cstate.filter.is_enabled(kind),
-            label=kind.label,
-            on_change=_toggle(kind),
+        ft.Container(
+            content=ft.Checkbox(
+                value=cstate.filter.is_enabled(kind),
+                label=kind.label,
+                on_change=_toggle(kind),
+                visual_density=ft.VisualDensity.COMPACT,
+            ),
+            height=22,
+            padding=ft.padding.all(0),
         )
         for kind in all_kinds()
     ]
@@ -1198,6 +1203,34 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
         if saved:
             state.status.set_message(controller.state.status)
 
+    def _generate(_e):
+        scenario = _ask_native_input(
+            "Scenario name (test_<scenario>):",
+            title="Generate tests",
+            default="smoke",
+        )
+        if not scenario:
+            state.status.set_message("Generate cancelled")
+            return
+        records = _records_for_codegen(state.recorder)
+        try:
+            artefacts = controller.generate_tests(
+                scenario.strip(), records=records
+            )
+        except FileExistsError as exc:
+            state.status.set_message(f"Generate refused: {exc}")
+            refresh()
+            return
+        except Exception as exc:
+            state.status.set_message(f"Generate failed: {exc}")
+            refresh()
+            return
+        rel = artefacts.test_module.relative_to(state.root)
+        state.status.set_message(
+            f"Generated {rel} ({len(artefacts.baselines)} baselines)"
+        )
+        refresh()
+
     def _close_web(_e):
         try:
             controller.close()
@@ -1207,11 +1240,22 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
             state.status.set_message("Web Auto closed")
             refresh()
 
+    can_generate = bool(cstate.included())
     button_row = ft.Row(
         controls=[
             ft.ElevatedButton("Apply", icon=ft.Icons.CHECK, on_click=_apply),
             ft.ElevatedButton(
                 "Take ElScrsht", icon=ft.Icons.PHOTO_CAMERA, on_click=_take
+            ),
+            ft.ElevatedButton(
+                "Generate tests",
+                icon=ft.Icons.SCIENCE,
+                on_click=_generate,
+                disabled=not can_generate,
+                tooltip=(
+                    "Render Page Object + pytest module from the filtered "
+                    "elements and recorded actions"
+                ),
             ),
             ft.ElevatedButton(
                 "Close",
@@ -1225,30 +1269,49 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
     )
 
     filtered = cstate.filtered()
+
+    def _toggle_inclusion(target: WebElement):
+        def handler(e: ft.ControlEvent) -> None:
+            controller.set_included(target, bool(e.control.value))
+        return handler
+
     list_rows: list[ft.Control] = []
     for el in filtered:
         is_selected = state.web_auto_selected is el or (
             state.web_auto_selected is not None
             and state.web_auto_selected.selector == el.selector
         )
+        included = cstate.is_included(el)
         bw = int(el.bounds[2])
         bh = int(el.bounds[3])
         row = ft.Row(
             controls=[
+                ft.Checkbox(
+                    value=included,
+                    on_change=_toggle_inclusion(el),
+                    tooltip="Include in generated test",
+                    visual_density=ft.VisualDensity.COMPACT,
+                ),
                 ft.Text(
                     f"[{el.display_role}]",
                     size=12,
                     weight=ft.FontWeight.BOLD,
                     color=ft.Colors.BLUE_700,
                 ),
-                ft.Text(el.display_name, size=12, expand=True),
+                ft.Text(
+                    el.display_name,
+                    size=12,
+                    expand=True,
+                    color=None if included else ft.Colors.GREY_500,
+                ),
                 ft.Text(
                     f"{bw}×{bh}",
                     size=11,
                     color=ft.Colors.GREY_700,
                 ),
             ],
-            spacing=6,
+            spacing=4,
+            tight=True,
         )
 
         def _on_pick(_e, picked=el):
@@ -1260,7 +1323,7 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
                 content=ft.GestureDetector(
                     content=ft.Container(
                         content=row,
-                        padding=ft.padding.symmetric(horizontal=4, vertical=2),
+                        padding=ft.padding.symmetric(horizontal=4, vertical=0),
                     ),
                     on_tap=_on_pick,
                     mouse_cursor=ft.MouseCursor.CLICK,
@@ -1371,6 +1434,26 @@ def _render_element_preview(
         return ft.Text(f"(preview failed: {exc})", size=11, color=ft.Colors.RED)
 
 
+def _records_for_codegen(
+    session: "RecorderSession | None",
+) -> list[tuple[RecorderAction, str | None, str | None]]:
+    """Flatten the recorder session into ``(action, asset, payload)`` triples.
+
+    ``asset`` is the basename of the captured PNG (matches the asset
+    folder layout the controller uses to seed baselines); ``payload``
+    carries the raw text / key / seconds the user provided for
+    non-pattern actions. Returns an empty list when no session has
+    been started yet.
+    """
+    if session is None:
+        return []
+    out: list[tuple[RecorderAction, str | None, str | None]] = []
+    for line in session.lines():
+        asset = line.pattern_path.name if line.pattern_path else None
+        out.append((line.action, asset, line.payload))
+    return out
+
+
 def _png_dimensions(data: bytes) -> tuple[int, int]:
     """Return (width, height) in pixels from a PNG byte string, or
     (0, 0) if the header isn't a valid PNG IHDR. Avoids pulling in
@@ -1451,7 +1534,7 @@ def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
     )
 
     overlays: list[ft.Control] = [page_image]
-    for el in cstate.filtered():
+    for el in cstate.included():
         x = el.bounds[0]
         y = el.bounds[1]
         w = el.bounds[2]

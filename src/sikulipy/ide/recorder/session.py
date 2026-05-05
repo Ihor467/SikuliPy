@@ -34,6 +34,7 @@ class RecordedLine:
     code: str
     pattern_path: Path | None = None  # absolute path inside the temp dir
     pattern_path2: Path | None = None  # second pattern (drag_drop / swipe)
+    payload: str | None = None  # raw text/key/seconds for TYPE/PAUSE/...
 
 
 @dataclass
@@ -107,7 +108,7 @@ class RecorderSession:
             raise ValueError(f"{action.value} requires a pattern, not a payload")
         gi = GenInput(payload=payload, surface=self.surface.name)
         code = self.generator.generate(action, gi)
-        line = RecordedLine(action=action, code=code)
+        line = RecordedLine(action=action, code=code, payload=payload)
         self._lines.append(line)
         self._notify()
         return line

@@ -35,8 +35,22 @@ if TYPE_CHECKING:
     import numpy as np
 
 
+@dataclass(frozen=True)
+class GeneratedTestArtefacts:
+    """Files produced by :meth:`WebAutoController.generate_tests`."""
+
+    page_object: Path
+    test_module: Path
+    baselines: list[Path]
+
+
 Subscriber = Callable[["WebAutoState"], None]
 AssetWriter = Callable[[Path, "np.ndarray"], Path]
+
+AUTO_INCLUDE_THRESHOLD = 10
+"""Filter result size at or below which every row is auto-included on
+Apply. Larger result sets default to none-selected so the user opts in
+explicitly without an overlay-flooded screenshot."""
 """Pluggable PNG writer — defaults to ``sikulipy.web.assets.write_png``;
 tests pass a recording stub."""
 
@@ -67,9 +81,22 @@ class WebAutoState:
     last_saved: list[Path] = field(default_factory=list)
     status: str = ""
     error: str | None = None
+    # Selectors of elements the user has *opted out* of after the filter
+    # was applied. Stored as exclusions (rather than inclusions) so the
+    # default "all visible elements participate" stays a no-op set —
+    # newly-discovered elements after a refresh are included
+    # automatically.
+    excluded: set[str] = field(default_factory=set)
 
     def filtered(self) -> list[WebElement]:
         return self.applied.apply(self.elements)
+
+    def included(self) -> list[WebElement]:
+        """Filtered elements minus the user's per-row exclusions."""
+        return [el for el in self.filtered() if el.selector not in self.excluded]
+
+    def is_included(self, element: WebElement) -> bool:
+        return element.selector not in self.excluded
 
 
 @dataclass
@@ -174,7 +201,15 @@ class WebAutoController:
         self.state.filter.toggle(kind, on)
 
     def apply_filter(self) -> list[WebElement]:
-        """Commit the pending filter and refresh overlays + list."""
+        """Commit the pending filter and refresh overlays + list.
+
+        Auto-selection heuristic: a small filtered set (<= 10) is most
+        likely the user's target — opt every row in. A large set is a
+        broad sweep the user will narrow down by hand — opt every row
+        out so the screenshot isn't drowned in overlays. The threshold
+        is intentionally hard-coded; tune by editing
+        :data:`AUTO_INCLUDE_THRESHOLD`.
+        """
         self.state.applied = ElementFilter(kinds=set(self.state.filter.kinds))
         if (
             self.state.selected is not None
@@ -182,9 +217,42 @@ class WebAutoController:
         ):
             self.state.selected = None
         result = self.state.filtered()
-        self.state.status = f"Filter applied — {len(result)} shown"
+        if len(result) <= AUTO_INCLUDE_THRESHOLD:
+            self.state.excluded = set()
+            picked = len(result)
+        else:
+            self.state.excluded = {el.selector for el in result}
+            picked = 0
+        self.state.status = (
+            f"Filter applied — {len(result)} shown, {picked} selected"
+        )
         self._notify()
         return result
+
+    def set_included(self, element: WebElement, on: bool) -> None:
+        """Toggle whether ``element`` participates in capture / codegen.
+
+        Drives the per-row checkbox in the Web Auto pane. Mutates
+        ``state.excluded`` and notifies subscribers so the screenshot
+        overlay stays in sync.
+        """
+        if not self.state.active:
+            return
+        if on:
+            self.state.excluded.discard(element.selector)
+        else:
+            self.state.excluded.add(element.selector)
+        self._notify()
+
+    def set_all_included(self, on: bool) -> None:
+        """Bulk toggle every filtered element."""
+        if not self.state.active:
+            return
+        if on:
+            self.state.excluded = set()
+        else:
+            self.state.excluded = {el.selector for el in self.state.filtered()}
+        self._notify()
 
     def select(self, element: WebElement | None) -> None:
         if not self.state.active:
@@ -204,9 +272,9 @@ class WebAutoController:
         if not self.state.active or not self.state.elements:
             return []
         backend = self._resolve_backend()
-        elements = self.state.filtered()
+        elements = self.state.included()
         if not elements:
-            self.state.status = "Nothing to save — filter is empty"
+            self.state.status = "Nothing to save — no elements selected"
             self._notify()
             return []
         try:
@@ -244,6 +312,143 @@ class WebAutoController:
         self._notify()
         return saved
 
+    # ---- Codegen -----------------------------------------------------
+    def generate_tests(
+        self,
+        scenario: str,
+        *,
+        records: Iterable[tuple[Any, str | None, str | None]] = (),
+        force: bool = False,
+    ) -> GeneratedTestArtefacts:
+        """Render Page Object + pytest module for the current session.
+
+        ``scenario`` is the human label that becomes the test function
+        name (``test_<scenario>``). ``records`` is a sequence of
+        ``(RecorderAction, asset_filename, payload)`` triples — pass the
+        recorder's session here so the generated test calls action
+        methods in recording order. The method walks the filtered
+        element list to build the catalogue, then writes:
+
+        * ``<project>/pages/<host_slug>.py`` (refuses to clobber unless
+          ``force=True``)
+        * ``<project>/tests/web/test_<scenario>.py`` (same)
+        * baseline PNGs copied from ``state.asset_dir`` into
+          ``<project>/baselines/web/<host>/`` (always overwrites — the
+          captured asset is the source of truth at generation time).
+        """
+        from sikulipy.ide.recorder.pom_codegen import (
+            PomLocator,
+            PomScenario,
+            locators_from_assets,
+            module_slug,
+            render_page_object,
+            render_test_module,
+            steps_from_records,
+            validate_python_source,
+        )
+        from sikulipy.testing.baseline import BaselineMetadata, BaselineStore
+
+        if not self.state.active or not self.state.url:
+            raise RuntimeError("Web Auto session is not active")
+        elements = self.state.included()
+        if not elements:
+            raise RuntimeError(
+                "No elements selected — apply a filter and tick the rows "
+                "you want to keep"
+            )
+
+        host = _host_for_url(self.state.url)
+        asset_dir = self.state.asset_dir or asset_root(
+            self.project_dir, self.state.url
+        )
+
+        # Map filtered WebElements → (asset, selector, text-or-None)
+        # triples. Locator names come from the asset filename; the
+        # accessible name lands as ``text`` only when it looks like a
+        # caption the test should assert (skip blank / role-only names).
+        triples: list[tuple[str, str | None, str | None]] = []
+        asset_to_loc: dict[str, str] = {}
+        for el in elements:
+            asset = f"{slug_for_element(el)}.png"
+            text = el.name.strip() if el.name and el.name.strip() else None
+            triples.append((asset, el.selector or None, text))
+        locators: list[PomLocator] = locators_from_assets(triples)
+        for el, loc in zip(elements, locators):
+            asset_to_loc[f"{slug_for_element(el)}.png"] = loc.name
+
+        steps = steps_from_records(list(records), asset_to_locator=asset_to_loc)
+        pom_scenario = PomScenario(
+            host=host,
+            url=self.state.url,
+            scenario=scenario,
+            locators=locators,
+            steps=steps,
+        )
+
+        page_src = render_page_object(pom_scenario)
+        test_src = render_test_module(pom_scenario)
+        validate_python_source(page_src)
+        validate_python_source(test_src)
+
+        host_module = module_slug(host)
+        scenario_module = module_slug(scenario)
+        page_path = self.project_dir / "pages" / f"{host_module}.py"
+        test_path = (
+            self.project_dir / "tests" / "web" / f"test_{scenario_module}.py"
+        )
+        if not force:
+            for p in (page_path, test_path):
+                if p.exists():
+                    raise FileExistsError(
+                        f"refusing to overwrite {p} — pass force=True to clobber"
+                    )
+
+        page_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        # Make pages a package so ``from pages.x import Y`` resolves.
+        init_path = page_path.parent / "__init__.py"
+        if not init_path.exists():
+            init_path.write_text("", encoding="utf-8")
+        page_path.write_text(page_src, encoding="utf-8")
+        test_path.write_text(test_src, encoding="utf-8")
+
+        # Drop a conftest.py once per project — owned by the user from
+        # then on, so re-running Generate doesn't clobber edits.
+        conftest_path = self.project_dir / "tests" / "web" / "conftest.py"
+        if not conftest_path.exists():
+            from sikulipy.testing.conftest_template import CONFTEST_SOURCE
+
+            conftest_path.write_text(CONFTEST_SOURCE, encoding="utf-8")
+
+        # Seed baselines from the captured PNGs. Asset_dir is the
+        # cropped-element folder; copy each kept locator's PNG into the
+        # baseline store. Missing PNGs (filter changed since last
+        # capture) are skipped silently — the test will fail loudly with
+        # the --update-baselines hint when run.
+        store = BaselineStore(self.project_dir, host)
+        seeded: list[Path] = []
+        for loc in locators:
+            src = asset_dir / loc.asset
+            if src.is_file():
+                seeded.append(store.promote_from(loc.asset, src))
+        store.write_metadata(
+            BaselineMetadata(
+                dpr=self.state.device_pixel_ratio,
+                viewport=self.state.document_size or (1600, 900),
+            )
+        )
+
+        self.state.status = (
+            f"Generated {test_path.name} + {page_path.name} "
+            f"({len(seeded)} baselines seeded)"
+        )
+        self._notify()
+        return GeneratedTestArtefacts(
+            page_object=page_path,
+            test_module=test_path,
+            baselines=seeded,
+        )
+
     # ---- Internals ---------------------------------------------------
     def _resolve_backend(self) -> BrowserBackend:
         if self.backend is None:
@@ -262,6 +467,14 @@ def _default_writer(target: Path, image: "np.ndarray") -> Path:
     from sikulipy.web.assets import write_png
 
     return write_png(target, image)
+
+
+def _host_for_url(url: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "unknown"
+    return host.lower()
 
 
 def all_kinds() -> Iterable[ElementKind]:
