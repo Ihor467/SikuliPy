@@ -39,6 +39,36 @@ uv run python src/sikulipy/ide/app.py      # direct file path
  is src/sikulipy/cli.py  # the CLI entry
 ```
 
+## Running generated Web Auto tests
+
+Tests produced by the IDE's **Generate tests** button live under
+`tests/web/test_<scenario>.py` and lean on `sikulipy.testing` +
+Playwright + OpenCV. From a fresh checkout:
+
+```bash
+# 1. Install with the web extra (pulls Playwright + opencv + pytest-playwright)
+uv pip install -e ".[dev,web]"
+
+# 2. Download the Chromium binary Playwright drives
+uv run playwright install chromium
+
+# 3. Tesseract — only needed if a locator uses an OCR text assertion
+sudo apt install tesseract-ocr           # Debian / Ubuntu
+# brew install tesseract                 # macOS
+# choco install tesseract                # Windows
+
+# 4. First run seeds the baseline PNGs from the current frame
+uv run pytest tests/web/test_<scenario>.py --update-baselines
+
+# 5. Subsequent runs verify against the seeded baselines
+uv run pytest tests/web/test_<scenario>.py
+```
+
+The IDE auto-captures element PNGs into `assets/web/<host>/` on
+Generate and promotes them into `baselines/web/<host>/`, so step 4
+is only needed when a baseline is missing or you deliberately want
+to refresh it.
+
 ## Layout
 
 ```
