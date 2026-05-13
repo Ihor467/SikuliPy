@@ -682,6 +682,41 @@ def _ask_native_input(prompt: str, title: str = "SikuliPy", default: str = "") -
     return value.strip() or None
 
 
+def _ask_native_confirm(prompt: str, title: str = "SikuliPy") -> bool:
+    """Yes/no dialog via kdialog → zenity → tk. Returns False on cancel.
+
+    Pads the prompt the same way the input dialog does so kdialog's
+    minimum-width quirk doesn't squash the message into one line.
+    """
+    from sikulipy.util.subprocess_env import native_dialog_env
+
+    env = native_dialog_env()
+    if kdialog := shutil.which("kdialog"):
+        r = subprocess.run(
+            [kdialog, "--title", title, "--yesno", prompt],
+            capture_output=True, text=True, env=env,
+        )
+        return r.returncode == 0
+    if zenity := shutil.which("zenity"):
+        r = subprocess.run(
+            [zenity, "--question", f"--title={title}", f"--text={prompt}"],
+            capture_output=True, text=True, env=env,
+        )
+        return r.returncode == 0
+    import tkinter
+    from tkinter import messagebox
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except tkinter.TclError:
+            pass
+        return bool(messagebox.askyesno(title, prompt, parent=root))
+    finally:
+        root.destroy()
+
+
 def _pick_target_native(
     entries: "list",
     *,
@@ -1226,24 +1261,63 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
                 scenario.strip(), records=records
             )
         except FileExistsError as exc:
-            state.status.set_message(f"Generate refused: {exc}")
-            refresh()
-            return
+            if not _ask_native_confirm(
+                f"{exc}\n\nOverwrite the existing files and re-seed baselines?",
+                title="Generate tests",
+            ):
+                msg = f"Generate cancelled (existing files kept): {exc}"
+                state.status.set_message("Generate cancelled")
+                state.console.write("stderr", f"\n{msg}\n")
+                refresh()
+                return
+            try:
+                artefacts = controller.generate_tests(
+                    scenario.strip(), records=records, force=True
+                )
+            except Exception as exc2:
+                msg = f"Generate failed: {exc2}"
+                state.status.set_message(msg)
+                state.console.write("stderr", f"\n{msg}\n")
+                refresh()
+                return
         except Exception as exc:
-            state.status.set_message(f"Generate failed: {exc}")
+            msg = f"Generate failed: {exc}"
+            state.status.set_message(msg)
+            state.console.write("stderr", f"\n{msg}\n")
             refresh()
             return
         rel = artefacts.test_module.relative_to(state.root)
         state.status.set_message(
             f"Generated {rel} ({len(artefacts.baselines)} baselines)"
         )
-        # Echo the run command into the Console so the user can copy
-        # it straight from the pane instead of reconstructing the path.
-        state.console.write(
-            "stdout",
-            f"\n$ python -m pytest {rel} --update-baselines  # first run seeds baselines\n"
-            f"$ python -m pytest {rel}\n",
-        )
+        # Echo the run command + which baselines landed into the
+        # Console so the user can copy the command and confirm every
+        # selected element got its PNG.
+        lines = [
+            "",
+            f"Generated {rel}",
+            f"Baselines ({len(artefacts.baselines)}):",
+        ]
+        for b in artefacts.baselines:
+            try:
+                lines.append(f"  - {b.relative_to(state.root)}")
+            except ValueError:
+                lines.append(f"  - {b}")
+        if artefacts.capture_failures:
+            lines.append("")
+            lines.append(
+                f"Auto-capture skipped {len(artefacts.capture_failures)} element(s):"
+            )
+            for reason in artefacts.capture_failures:
+                lines.append(f"  ! {reason}")
+        lines.extend([
+            "",
+            f"$ python -m pytest {rel} --update-baselines  # first run seeds baselines",
+            f"$ python -m pytest {rel}",
+            "",
+        ])
+        stream = "stderr" if artefacts.capture_failures else "stdout"
+        state.console.write(stream, "\n".join(lines))
         refresh()
 
     def _close_web(_e):

@@ -42,6 +42,7 @@ class GeneratedTestArtefacts:
     page_object: Path
     test_module: Path
     baselines: list[Path]
+    capture_failures: list[str] = field(default_factory=list)
 
 
 Subscriber = Callable[["WebAutoState"], None]
@@ -290,19 +291,28 @@ class WebAutoController:
         return saved
 
     def _capture_elements(
-        self, elements: Iterable[WebElement], asset_dir: Path
+        self,
+        elements: Iterable[WebElement],
+        asset_dir: Path,
+        *,
+        failures: list[str] | None = None,
     ) -> list[Path]:
         """Crop each element from the live frame and write a PNG under
         ``asset_dir``. Shared by :meth:`take_screenshots` and the
-        auto-capture path in :meth:`generate_tests`. Sets
-        ``state.error`` and returns the partial list on write failures;
-        returns an empty list if the backend frame can't be read.
+        auto-capture path in :meth:`generate_tests`. Appends per-element
+        reasons to ``failures`` (if provided) so callers can surface
+        silent crop/write errors instead of just seeing a short list.
+        Sets ``state.error`` and returns the partial list on write
+        failures; returns an empty list if the backend frame can't be
+        read.
         """
         backend = self._resolve_backend()
         try:
             frame = backend.frame()
         except Exception as exc:
             self.state.error = f"Could not read frame: {exc}"
+            if failures is not None:
+                failures.append(f"frame unavailable: {exc}")
             return []
         writer = self.asset_writer or _default_writer
         saved: list[Path] = []
@@ -313,13 +323,17 @@ class WebAutoController:
                     el.bounds,
                     device_pixel_ratio=self.state.device_pixel_ratio,
                 )
-            except Exception:
+            except Exception as exc:
+                if failures is not None:
+                    failures.append(f"{slug_for_element(el)}: crop failed ({exc})")
                 continue
             target = asset_dir / f"{slug_for_element(el)}.png"
             try:
                 writer(target, cropped)
             except Exception as exc:
                 self.state.error = f"Write failed for {target.name}: {exc}"
+                if failures is not None:
+                    failures.append(f"{target.name}: write failed ({exc})")
                 continue
             saved.append(target)
         return saved
@@ -442,14 +456,30 @@ class WebAutoController:
             el for el, loc in zip(elements, locators)
             if not (asset_dir / loc.asset).is_file()
         ]
+        capture_failures: list[str] = []
         if missing:
-            self._capture_elements(missing, asset_dir)
+            # Re-snapshot so the cached frame is current — otherwise
+            # ``backend.frame()`` either raises (no cache yet) or hands
+            # us a stale picture of the page from before discover().
+            backend = self._resolve_backend()
+            try:
+                shot_dir = self._ensure_screenshot_dir()
+                backend.screenshot(shot_dir / "page.png")
+            except Exception as exc:
+                capture_failures.append(f"refresh before capture failed: {exc}")
+            self._capture_elements(
+                missing, asset_dir, failures=capture_failures
+            )
         store = BaselineStore(self.project_dir, host)
         seeded: list[Path] = []
         for loc in locators:
             src = asset_dir / loc.asset
             if src.is_file():
                 seeded.append(store.promote_from(loc.asset, src))
+            else:
+                capture_failures.append(
+                    f"{loc.asset}: no PNG in {asset_dir.name}/ to promote"
+                )
         store.write_metadata(
             BaselineMetadata(
                 dpr=self.state.device_pixel_ratio,
@@ -466,6 +496,7 @@ class WebAutoController:
             page_object=page_path,
             test_module=test_path,
             baselines=seeded,
+            capture_failures=capture_failures,
         )
 
     # ---- Internals ---------------------------------------------------
