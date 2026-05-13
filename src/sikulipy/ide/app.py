@@ -1932,7 +1932,10 @@ def _build_recorder_bar(state: _IDEState, page: ft.Page, refresh: callable) -> f
         refresh()
 
     def _start_web_auto(_e):
-        prompt = "Web Auto — please provide URL:"
+        label = "Web Auto — please provide URL:"
+        # kdialog/zenity size the input window to fit the prompt label,
+        # so pad the label to roughly 2× width to widen the dialog.
+        prompt = label.center(len(label) * 2)
         # Hide the IDE before popping the native input — on KWin the
         # kdialog/zenity window otherwise lands behind the IDE and the
         # user sees a "nothing happened" click.
