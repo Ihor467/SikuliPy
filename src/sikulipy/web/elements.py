@@ -28,6 +28,7 @@ class ElementKind(str, Enum):
     SELECT = "select"
     MENU = "menu"
     TAB = "tab"
+    HEADING = "heading"
     OTHER = "other"
 
     @property
@@ -43,6 +44,7 @@ _KIND_LABELS = {
     ElementKind.SELECT: "Selects & Dropdowns",
     ElementKind.MENU: "Menu items",
     ElementKind.TAB: "Tabs",
+    ElementKind.HEADING: "Headings",
     ElementKind.OTHER: "Other",
 }
 
@@ -141,6 +143,9 @@ def classify(tag: str, type_attr: str, role: str) -> ElementKind:
     if tag == "summary":
         return ElementKind.MENU
 
+    if tag in {"h1", "h2", "h3", "h4", "h5", "h6"} or role == "heading":
+        return ElementKind.HEADING
+
     return ElementKind.OTHER
 
 
@@ -175,6 +180,8 @@ DISCOVERY_JS = r"""
     '[role="menuitemradio"]',
     '[role="option"]',
     '[role="tab"]',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    '[role="heading"]',
     '[onclick]',
     '[tabindex]:not([tabindex="-1"])',
   ].join(',');

@@ -487,5 +487,6 @@ def all_kinds() -> Iterable[ElementKind]:
         ElementKind.SELECT,
         ElementKind.MENU,
         ElementKind.TAB,
+        ElementKind.HEADING,
         ElementKind.OTHER,
     ]

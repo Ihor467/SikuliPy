@@ -81,6 +81,9 @@ def test_classify_covers_every_kind() -> None:
         (("div", "", "tab"), ElementKind.TAB),
         (("div", "", "menuitem"), ElementKind.MENU),
         (("summary", "", ""), ElementKind.MENU),
+        (("h1", "", ""), ElementKind.HEADING),
+        (("h3", "", ""), ElementKind.HEADING),
+        (("div", "", "heading"), ElementKind.HEADING),
         (("div", "", ""), ElementKind.OTHER),
     ]
     for (tag, type_attr, role), expected in cases:
