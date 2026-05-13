@@ -1237,6 +1237,13 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
         state.status.set_message(
             f"Generated {rel} ({len(artefacts.baselines)} baselines)"
         )
+        # Echo the run command into the Console so the user can copy
+        # it straight from the pane instead of reconstructing the path.
+        state.console.write(
+            "stdout",
+            f"\n$ python -m pytest {rel} --update-baselines  # first run seeds baselines\n"
+            f"$ python -m pytest {rel}\n",
+        )
         refresh()
 
     def _close_web(_e):

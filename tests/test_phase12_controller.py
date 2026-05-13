@@ -114,6 +114,37 @@ def test_generate_tests_seeds_baselines_from_assets(tmp_path: Path) -> None:
     assert (baseline_dir / ".metadata.json").is_file()
 
 
+def test_generate_tests_auto_captures_missing_assets(tmp_path: Path) -> None:
+    # Build a controller exactly like _start_with_filter but skip the
+    # take_screenshots() call — simulates the user clicking Generate
+    # without first clicking Take ElScrsht.
+    ctrl = WebAutoController(
+        project_dir=tmp_path,
+        backend=_backend(),
+        asset_writer=lambda p, _i: (
+            p.parent.mkdir(parents=True, exist_ok=True),
+            p.write_bytes(b"fake-png"),
+            p,
+        )[-1],
+    )
+    ctrl.start("https://example.com/login")
+    for k in (ElementKind.INPUT, ElementKind.BUTTON):
+        ctrl.set_filter_kind(k, True)
+    ctrl.apply_filter()
+    # Sanity: no assets on disk yet.
+    asset_dir = ctrl.state.asset_dir
+    assert asset_dir is not None and not any(asset_dir.glob("*.png"))
+
+    out = ctrl.generate_tests("smoke")
+
+    # All three baselines should land even though Take ElScrsht was
+    # never called — generate_tests auto-captured the missing PNGs.
+    assert len(out.baselines) == 3
+    baseline_dir = tmp_path / "baselines" / "web" / "example.com"
+    for b in out.baselines:
+        assert (baseline_dir / b.name).is_file()
+
+
 def test_generate_tests_refuses_to_clobber(tmp_path: Path) -> None:
     ctrl = _start_with_filter(tmp_path)
     ctrl.generate_tests("smoke")

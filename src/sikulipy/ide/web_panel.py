@@ -277,16 +277,34 @@ class WebAutoController:
             self.state.status = "Nothing to save — no elements selected"
             self._notify()
             return []
+        asset_dir = self.state.asset_dir or asset_root(
+            self.project_dir, self.state.url or "unknown"
+        )
+        saved = self._capture_elements(elements, asset_dir)
+        self.state.last_saved = saved
+        self.state.status = (
+            f"Saved {len(saved)} elements → "
+            f"{asset_dir.relative_to(self.project_dir) if asset_dir.is_relative_to(self.project_dir) else asset_dir}"
+        )
+        self._notify()
+        return saved
+
+    def _capture_elements(
+        self, elements: Iterable[WebElement], asset_dir: Path
+    ) -> list[Path]:
+        """Crop each element from the live frame and write a PNG under
+        ``asset_dir``. Shared by :meth:`take_screenshots` and the
+        auto-capture path in :meth:`generate_tests`. Sets
+        ``state.error`` and returns the partial list on write failures;
+        returns an empty list if the backend frame can't be read.
+        """
+        backend = self._resolve_backend()
         try:
             frame = backend.frame()
         except Exception as exc:
             self.state.error = f"Could not read frame: {exc}"
-            self._notify()
             return []
         writer = self.asset_writer or _default_writer
-        asset_dir = self.state.asset_dir or asset_root(
-            self.project_dir, self.state.url or "unknown"
-        )
         saved: list[Path] = []
         for el in elements:
             try:
@@ -304,12 +322,6 @@ class WebAutoController:
                 self.state.error = f"Write failed for {target.name}: {exc}"
                 continue
             saved.append(target)
-        self.state.last_saved = saved
-        self.state.status = (
-            f"Saved {len(saved)} elements → "
-            f"{asset_dir.relative_to(self.project_dir) if asset_dir.is_relative_to(self.project_dir) else asset_dir}"
-        )
-        self._notify()
         return saved
 
     # ---- Codegen -----------------------------------------------------
@@ -422,9 +434,16 @@ class WebAutoController:
 
         # Seed baselines from the captured PNGs. Asset_dir is the
         # cropped-element folder; copy each kept locator's PNG into the
-        # baseline store. Missing PNGs (filter changed since last
-        # capture) are skipped silently — the test will fail loudly with
-        # the --update-baselines hint when run.
+        # baseline store. If the user clicked Generate without first
+        # taking element screenshots (or changed the filter since the
+        # last capture), auto-crop the missing PNGs from the live frame
+        # so every locator ships with a baseline.
+        missing = [
+            el for el, loc in zip(elements, locators)
+            if not (asset_dir / loc.asset).is_file()
+        ]
+        if missing:
+            self._capture_elements(missing, asset_dir)
         store = BaselineStore(self.project_dir, host)
         seeded: list[Path] = []
         for loc in locators:
