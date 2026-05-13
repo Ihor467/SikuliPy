@@ -104,6 +104,14 @@ class _IDEState:
         # Currently-selected element in the Web Auto pane (driven by
         # the controller's state but cached here for the Flet view).
         self.web_auto_selected: "WebElement | None" = None
+        # Cached scroll offset for the Web Auto screenshot's ListView,
+        # in CSS pixels. Tracked via on_scroll and reapplied after each
+        # refresh() so toggling a row's inclusion checkbox doesn't snap
+        # the screenshot back to the top.
+        self.web_auto_scroll_offset: float = 0.0
+        # The live screenshot ListView from the most recent build, kept
+        # so refresh() can call scroll_to() on it after page.update().
+        self.web_auto_list_view: "ft.ListView | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1245,8 @@ def _build_web_auto_pane(state: _IDEState, refresh: callable) -> ft.Container:
         finally:
             state.web_auto = None
             state.web_auto_selected = None
+            state.web_auto_scroll_offset = 0.0
+            state.web_auto_list_view = None
             state.status.set_message("Web Auto closed")
             refresh()
 
@@ -1566,17 +1576,23 @@ def _build_web_auto_screenshot(state: _IDEState) -> ft.Container:
             )
         )
 
+    def _on_scroll(e: ft.OnScrollEvent) -> None:
+        state.web_auto_scroll_offset = float(e.pixels or 0.0)
+
+    list_view = ft.ListView(
+        controls=[
+            ft.Stack(
+                controls=overlays,
+                width=stack_w,
+                height=stack_h,
+            ),
+        ],
+        expand=True,
+        on_scroll=_on_scroll,
+    )
+    state.web_auto_list_view = list_view
     return ft.Container(
-        content=ft.ListView(
-            controls=[
-                ft.Stack(
-                    controls=overlays,
-                    width=stack_w,
-                    height=stack_h,
-                ),
-            ],
-            expand=True,
-        ),
+        content=list_view,
         bgcolor=ft.Colors.WHITE,
         expand=True,
         clip_behavior=ft.ClipBehavior.HARD_EDGE,
@@ -2260,6 +2276,7 @@ def ide_main(page: ft.Page) -> None:
         if state.web_auto is not None:
             editor_row = _build_web_auto_screenshot(state)
         else:
+            state.web_auto_list_view = None
             explorer_pane = _build_explorer(state, refresh)
             editor_pane = _build_editor(
                 state, refresh, refresh_statusbar, refresh_sidebar
@@ -2317,6 +2334,16 @@ def ide_main(page: ft.Page) -> None:
         ]
         statusbar.content = _statusbar_row(state)
         page.update()
+        # Restore Web Auto scroll position: rebuilding the screenshot
+        # pane mounts a fresh ListView at offset 0, which makes per-row
+        # checkbox toggles jerk the page back to the top. scroll_to
+        # has to fire after page.update() so the control is mounted.
+        lv = state.web_auto_list_view
+        if lv is not None and state.web_auto_scroll_offset > 0:
+            try:
+                lv.scroll_to(offset=state.web_auto_scroll_offset, duration=0)
+            except Exception:
+                pass
 
     # Pipe console writes back into the UI.
     state.console.subscribe(lambda _entry: refresh())
